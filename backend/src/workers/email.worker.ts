@@ -1,26 +1,22 @@
-import { Worker, Job } from 'bullmq';
-import { EMAIL_QUEUE_NAME, EmailJobData, redisConnection, scheduleEmailInQueue } from '../queues/email.queue.js';
+import { Worker, Job, DelayedError } from 'bullmq';
+import { EMAIL_QUEUE_NAME, EmailJobData, redisConnection } from '../queues/email.queue.js';
 import { prisma } from '../db/prisma.js';
 import { env } from '../config/env.js';
 import { sendEmailViaSender } from '../services/email.js';
 import { updateEmailJobInES } from '../services/elasticsearch.js';
 import { sendRateLimitSlackAlert } from '../services/slack.js';
-
-function getHourWindowKey(senderId: string): string {
-  const hourString = new Date().toISOString().slice(0, 13); // e.g. "2026-10-17T11"
-  return `ratelimit:sender:${senderId}:${hourString}`;
-}
+import { checkAndIncrementRateLimit, decrementRateLimit } from '../services/rate-limiter.js';
 
 export function createEmailWorker() {
   const worker = new Worker<EmailJobData>(
     EMAIL_QUEUE_NAME,
-    async (job: Job<EmailJobData>) => {
+    async (job: Job<EmailJobData>, token?: string) => {
       const { emailJobId, senderId, toEmail, subject, body } = job.data;
       const hourlyLimit = job.data.hourlyLimit || env.MAX_EMAILS_PER_HOUR_PER_SENDER;
       const minDelay = job.data.delayBetweenEmailsMs ?? env.MIN_DELAY_BETWEEN_EMAILS_MS;
 
       // 1. Atomic status transition: scheduled -> processing
-      // If 0 rows updated, skip immediately. This guarantees a job is NEVER sent twice even under race conditions.
+      // If 0 rows updated, another worker picked it up or it was already sent. Skip immediately.
       const updateResult = await prisma.emailJob.updateMany({
         where: {
           id: emailJobId,
@@ -32,54 +28,69 @@ export function createEmailWorker() {
       });
 
       if (updateResult.count === 0) {
-        console.log(
-          `⚠️ [Idempotency Guard] Job ${emailJobId} is already processing, sent, or not found. Skipping.`
-        );
         return { skipped: true };
       }
 
-      // Fetch the full record with sender details
+      // Fetch the full record with sender credentials
       const emailRecord = await prisma.emailJob.findUnique({
         where: { id: emailJobId },
         include: { sender: true },
       });
 
       if (!emailRecord) {
-        console.warn(`⚠️ EmailJob ${emailJobId} record missing after transition. Skipping.`);
+        console.warn(`⚠️ EmailJob ${emailJobId} record missing. Skipping.`);
         return { skipped: true };
       }
 
-      // 2. Check Hourly Rate Limit in Redis
-      const rateLimitKey = getHourWindowKey(senderId);
-      const currentHourlyCount = parseInt((await redisConnection.get(rateLimitKey)) || '0', 10);
+      // 2. Atomic Rate Limit Check via Redis Lua Script
+      const rateCheck = await checkAndIncrementRateLimit(senderId, hourlyLimit);
 
-      if (currentHourlyCount >= hourlyLimit) {
-        const nextHour = new Date();
-        nextHour.setHours(nextHour.getHours() + 1, 0, 0, 0);
+      if (!rateCheck.allowed) {
+        // Limit exceeded! Calculate start of next hour window + offset based on original scheduledAt
+        const now = new Date();
+        const nextHour = new Date(now);
+        nextHour.setUTCHours(nextHour.getUTCHours() + 1, 0, 0, 0);
+
+        // Small offset based on original scheduledAt to strictly preserve batch sequence
+        const originalTimeMs = new Date(emailRecord.scheduledAt).getTime();
+        const offsetMs = Math.abs(originalTimeMs % 60000); // 0-59999ms offset
+        const rescheduledTimestamp = nextHour.getTime() + offsetMs;
+        const rescheduledDate = new Date(rescheduledTimestamp);
 
         console.warn(
-          `🚨 Rate limit hit for sender ${emailRecord.sender.email} (${currentHourlyCount}/${hourlyLimit}). Rescheduling job ${emailJobId} to ${nextHour.toISOString()}`
+          `🚨 [Rate Limit Exceeded] Sender ${emailRecord.sender.email} hit limit of ${hourlyLimit}/hr in ${rateCheck.hourKey}. Delaying job ${emailJobId} to ${rescheduledDate.toISOString()}`
         );
 
-        // Reset back to scheduled at next hour
+        // Reset status to 'scheduled' and update scheduledAt in DB
         await prisma.emailJob.update({
           where: { id: emailJobId },
           data: {
-            scheduledAt: nextHour,
+            scheduledAt: rescheduledDate,
             status: 'scheduled',
           },
         });
 
-        // Trigger real Slack alert
-        await sendRateLimitSlackAlert(emailRecord.userId, emailRecord.sender.email, hourlyLimit, nextHour);
+        // Update Elasticsearch
+        await updateEmailJobInES(emailJobId, {
+          status: 'scheduled',
+          scheduledAt: rescheduledDate,
+        });
 
-        // Re-enqueue in BullMQ for next hour window
-        await scheduleEmailInQueue(job.data, nextHour);
+        // Send real Slack alert (deduplicated per sender per hour window via Redis SET NX)
+        await sendRateLimitSlackAlert(
+          emailRecord.userId,
+          emailRecord.sender.email,
+          hourlyLimit,
+          rescheduledDate,
+          rateCheck.hourKey
+        );
 
-        return { rateLimited: true, rescheduledTo: nextHour };
+        // Move job to delayed in BullMQ and throw DelayedError (graceful reschedule without failing)
+        await job.moveToDelayed(rescheduledTimestamp, token);
+        throw new DelayedError();
       }
 
-      // 3. Minimum delay throttling between email sends
+      // 3. Minimum delay between individual email sends
       const lastSendKey = `sender:last_send:${senderId}`;
       const lastSendTimeStr = await redisConnection.get(lastSendKey);
       if (lastSendTimeStr) {
@@ -87,12 +98,11 @@ export function createEmailWorker() {
         const elapsed = Date.now() - lastSendTime;
         if (elapsed < minDelay) {
           const waitTime = minDelay - elapsed;
-          console.log(`⏳ Provider delay: waiting ${waitTime}ms before sending from ${emailRecord.sender.email}`);
           await new Promise((resolve) => setTimeout(resolve, waitTime));
         }
       }
 
-      // 4. Send email via Nodemailer using Ethereal SMTP
+      // 4. Send email via Nodemailer with Ethereal SMTP
       try {
         const sendResult = await sendEmailViaSender(emailRecord.sender, {
           to: toEmail,
@@ -102,16 +112,10 @@ export function createEmailWorker() {
 
         const now = new Date();
 
-        // Increment Redis rate limit counter
-        const newCount = await redisConnection.incr(rateLimitKey);
-        if (newCount === 1) {
-          await redisConnection.expire(rateLimitKey, 7200);
-        }
-
-        // Record last send time
+        // Record last send timestamp
         await redisConnection.set(lastSendKey, Date.now().toString(), 'EX', 3600);
 
-        // Mark sent in DB with sentAt
+        // Mark sent in DB
         await prisma.emailJob.update({
           where: { id: emailJobId },
           data: {
@@ -124,7 +128,7 @@ export function createEmailWorker() {
         // Update Elasticsearch
         await updateEmailJobInES(emailJobId, { status: 'sent', sentAt: now });
 
-        // Print Ethereal preview URLs prominently in the logs as required
+        // Print Ethereal preview URLs prominently in logs
         console.log(`\n============================================================`);
         console.log(`🚀 [EMAIL SENT] Job ID: ${emailJobId}`);
         console.log(`   From: ${emailRecord.sender.name} <${emailRecord.sender.email}>`);
@@ -139,6 +143,9 @@ export function createEmailWorker() {
           previewUrl: sendResult.previewUrl,
         };
       } catch (sendErr) {
+        // Decrement counter if send fails before delivery
+        await decrementRateLimit(rateCheck.hourKey);
+
         const errorMsg = (sendErr as Error).message;
         console.error(`❌ [Failed] Error sending email ${emailJobId}:`, errorMsg);
 
@@ -163,7 +170,9 @@ export function createEmailWorker() {
   );
 
   worker.on('failed', (job, err) => {
-    console.error(`❌ Job ${job?.id} failed with error:`, err.message);
+    if (err.name !== 'DelayedError') {
+      console.error(`❌ Job ${job?.id} failed with error:`, err.message);
+    }
   });
 
   return worker;

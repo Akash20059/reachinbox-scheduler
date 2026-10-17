@@ -242,6 +242,72 @@ export async function getEmailStats(req: AuthenticatedRequest, res: Response): P
   }
 }
 
+export async function searchEmails(req: AuthenticatedRequest, res: Response): Promise<void> {
+  try {
+    const q = (req.query.q as string) || (req.query.search as string) || '';
+    const status = req.query.status as string;
+    const page = Math.max(1, parseInt((req.query.page as string) || '1', 10));
+    const limit = Math.max(1, Math.min(100, parseInt((req.query.limit as string) || '20', 10)));
+    const skip = (page - 1) * limit;
+
+    // 1. Full-text search via Elasticsearch
+    const esResult = await searchEmailsInES({
+      q,
+      status,
+      from: skip,
+      size: limit,
+    });
+
+    if (esResult) {
+      res.json({
+        total: esResult.total,
+        page,
+        limit,
+        totalPages: Math.ceil(esResult.total / limit),
+        emails: esResult.emails,
+        source: 'elasticsearch',
+      });
+      return;
+    }
+
+    // 2. Database fallback if ES is warming up
+    const whereClause: any = {};
+    if (status) {
+      whereClause.status = status;
+    }
+    if (q && q.trim()) {
+      whereClause.OR = [
+        { toEmail: { contains: q, mode: 'insensitive' } },
+        { subject: { contains: q, mode: 'insensitive' } },
+        { body: { contains: q, mode: 'insensitive' } },
+      ];
+    }
+
+    const [total, emails] = await Promise.all([
+      prisma.emailJob.count({ where: whereClause }),
+      prisma.emailJob.findMany({
+        where: whereClause,
+        include: { sender: { select: { id: true, name: true, email: true } } },
+        orderBy: { scheduledAt: 'desc' },
+        skip,
+        take: limit,
+      }),
+    ]);
+
+    res.json({
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
+      emails,
+      source: 'postgres',
+    });
+  } catch (error) {
+    console.error('Error searching emails:', error);
+    res.status(500).json({ error: 'Failed to search emails' });
+  }
+}
+
 export async function getSenders(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
     const senders = await prisma.sender.findMany({

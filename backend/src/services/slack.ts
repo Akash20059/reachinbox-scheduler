@@ -1,6 +1,7 @@
 import axios from 'axios';
 import { prisma } from '../db/prisma.js';
 import { env } from '../config/env.js';
+import { redisConnection } from '../queues/email.queue.js';
 
 export function getSlackOAuthUrl(userId: string): string {
   const scope = encodeURIComponent('incoming-webhook,chat:write');
@@ -55,42 +56,54 @@ export async function exchangeSlackCode(code: string, userId: string) {
   return connection;
 }
 
+/**
+ * Sends a real Slack notification on hourly limit hit.
+ * Uses Redis SET NX to ensure it fires only once per sender per hour window.
+ * Silently skips with zero crash if user has not connected Slack.
+ */
 export async function sendRateLimitSlackAlert(
   userId: string | null | undefined,
   senderEmail: string,
   hourlyLimit: number,
-  rescheduledTo: Date
+  rescheduledTo: Date,
+  hourKey: string
 ) {
-  if (!userId) {
-    // If job was triggered without specific user, check for any connected Slack workspace
-    const anyConnection = await prisma.slackConnection.findFirst();
-    if (!anyConnection?.webhookUrl) return;
-    return sendWebhookPayload(anyConnection.webhookUrl, senderEmail, hourlyLimit, rescheduledTo);
-  }
+  // 1. Deduplication Guard: Once per sender per hour window
+  const alertDedupeKey = `alert_sent:${senderEmail}:${hourKey}`;
+  const acquired = await redisConnection.set(alertDedupeKey, '1', 'EX', 7200, 'NX');
 
-  const connection = await prisma.slackConnection.findUnique({
-    where: { userId },
-  });
-
-  if (!connection?.webhookUrl) {
-    console.log(`ℹ️ Slack alert skipped: user ${userId} has not connected Slack.`);
+  if (!acquired) {
+    // Alert already dispatched for this sender in this hour window
     return;
   }
 
-  return sendWebhookPayload(connection.webhookUrl, senderEmail, hourlyLimit, rescheduledTo);
-}
+  // 2. Fetch connection from DB dynamically (handles reconnecting without redeploy)
+  let webhookUrl: string | null = null;
 
-async function sendWebhookPayload(
-  webhookUrl: string,
-  senderEmail: string,
-  hourlyLimit: number,
-  rescheduledTo: Date
-) {
+  if (userId) {
+    const userConnection = await prisma.slackConnection.findUnique({
+      where: { userId },
+    });
+    webhookUrl = userConnection?.webhookUrl || null;
+  }
+
+  if (!webhookUrl) {
+    // Fallback: check if any user connected Slack (useful in dev/demo)
+    const anyConnection = await prisma.slackConnection.findFirst();
+    webhookUrl = anyConnection?.webhookUrl || null;
+  }
+
+  if (!webhookUrl) {
+    // Silently skip if user has not connected Slack
+    return;
+  }
+
   try {
-    const formattedDate = rescheduledTo.toLocaleTimeString('en-US', {
+    const formattedTime = rescheduledTo.toLocaleTimeString('en-US', {
       hour: '2-digit',
       minute: '2-digit',
       second: '2-digit',
+      timeZoneName: 'short',
     });
 
     const payload = {
@@ -99,7 +112,7 @@ async function sendWebhookPayload(
           type: 'header',
           text: {
             type: 'plain_text',
-            text: '⚠️ Email Hourly Rate Limit Exceeded',
+            text: '🚨 Rate Limit Reached - ReachInbox Scheduler',
             emoji: true,
           },
         },
@@ -107,7 +120,7 @@ async function sendWebhookPayload(
           type: 'section',
           text: {
             type: 'mrkdwn',
-            text: `*Sender:* \`${senderEmail}\`\n*Limit:* \`${hourlyLimit} emails / hour\` reached!\n*Action Taken:* Remaining jobs have been *safely rescheduled* to the next available hour window (*${formattedDate}*). No emails were dropped.`,
+            text: `*Sender:* \`${senderEmail}\`\n*Hourly Limit:* \`${hourlyLimit} emails/hr\` reached for window *${hourKey}*.\n\n*Safety Action:* Jobs have been automatically delayed to the next window (*${formattedTime}*) preserving order. Zero emails were lost.`,
           },
         },
         {
@@ -125,8 +138,9 @@ async function sendWebhookPayload(
     const res = await axios.post(webhookUrl, payload, {
       headers: { 'Content-Type': 'application/json' },
     });
-    console.log('✅ Real Slack notification sent successfully:', res.status);
-  } catch (err) {
-    console.error('❌ Failed to dispatch Slack rate limit alert:', (err as Error).message);
+
+    console.log(`\n🔔 [SLACK NOTIFICATION SENT] To channel for sender ${senderEmail} (Status: ${res.status})\n`);
+  } catch (error) {
+    console.error('❌ Failed to dispatch Slack rate limit alert:', (error as Error).message);
   }
 }

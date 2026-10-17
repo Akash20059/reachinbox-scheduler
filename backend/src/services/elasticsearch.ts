@@ -5,7 +5,7 @@ export const esClient = new Client({
   node: env.ELASTICSEARCH_URL,
 });
 
-export const EMAILS_INDEX = 'reachinbox_emails';
+export const EMAILS_INDEX = 'emails';
 
 export async function initElasticsearch() {
   try {
@@ -36,7 +36,7 @@ export async function initElasticsearch() {
       console.log(`✅ Elasticsearch index "${EMAILS_INDEX}" ready.`);
     }
   } catch (error) {
-    console.warn('⚠️ Elasticsearch initialization warning (will retry on operations):', (error as Error).message);
+    console.warn('⚠️ Elasticsearch initialization warning:', (error as Error).message);
   }
 }
 
@@ -79,7 +79,7 @@ export async function indexEmailJob(job: {
 
 export async function updateEmailJobInES(
   id: string,
-  update: { status?: string; sentAt?: Date | null; error?: string | null }
+  update: { status?: string; sentAt?: Date | null; error?: string | null; scheduledAt?: Date | string }
 ) {
   try {
     await esClient.update({
@@ -94,9 +94,8 @@ export async function updateEmailJobInES(
 }
 
 export async function searchEmailsInES(params: {
-  query?: string;
+  q?: string;
   status?: string;
-  userId?: string;
   from?: number;
   size?: number;
 }) {
@@ -107,15 +106,11 @@ export async function searchEmailsInES(params: {
       must.push({ term: { status: params.status } });
     }
 
-    if (params.userId) {
-      must.push({ term: { userId: params.userId } });
-    }
-
-    if (params.query && params.query.trim()) {
+    if (params.q && params.q.trim()) {
       must.push({
         multi_match: {
-          query: params.query.trim(),
-          fields: ['toEmail^3', 'subject^2', 'body', 'senderEmail'],
+          query: params.q.trim(),
+          fields: ['subject', 'body', 'toEmail'],
           fuzziness: 'AUTO',
         },
       });
@@ -129,12 +124,17 @@ export async function searchEmailsInES(params: {
       sort: [{ scheduledAt: { order: 'desc' } }],
     });
 
+    const total =
+      typeof response.hits.total === 'number'
+        ? response.hits.total
+        : response.hits.total?.value || 0;
+
     return {
-      total: typeof response.hits.total === 'number' ? response.hits.total : response.hits.total?.value || 0,
-      hits: response.hits.hits.map((hit) => hit._source),
+      total,
+      emails: response.hits.hits.map((hit) => hit._source),
     };
   } catch (error) {
     console.error('❌ Elasticsearch search error:', (error as Error).message);
-    return null; // fallback to DB if ES search fails
+    return null;
   }
 }
