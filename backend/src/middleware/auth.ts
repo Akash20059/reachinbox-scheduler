@@ -10,41 +10,57 @@ export interface AuthUser {
   avatar?: string | null;
 }
 
-export interface AuthenticatedRequest extends Request {
-  user?: AuthUser;
+declare global {
+  namespace Express {
+    // Extend Passport's User interface
+    interface User extends AuthUser {}
+  }
 }
 
+export type AuthenticatedRequest = Request;
+
 export async function authMiddleware(
-  req: AuthenticatedRequest,
+  req: Request,
   res: Response,
   next: NextFunction
 ): Promise<void> {
   try {
-    const authHeader = req.headers.authorization;
+    let token: string | undefined;
 
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      // For development ease, fallback to the first user or mock user if no token provided
-      const defaultUser = await prisma.user.findFirst();
-      if (defaultUser) {
-        req.user = {
-          id: defaultUser.id,
-          email: defaultUser.email,
-          name: defaultUser.name,
-          avatar: defaultUser.avatar,
-        };
-        return next();
-      }
-
-      res.status(401).json({ error: 'Unauthorized: Missing or invalid token' });
-      return;
+    // 1. Check httpOnly cookie
+    if (req.cookies && req.cookies.token) {
+      token = req.cookies.token;
     }
 
-    const token = authHeader.split(' ')[1];
-    const decoded = jwt.verify(token, env.JWT_SECRET) as AuthUser;
+    // 2. Fallback to Authorization Header
+    if (!token && req.headers.authorization && req.headers.authorization.startsWith('Bearer ')) {
+      token = req.headers.authorization.split(' ')[1];
+    }
 
-    req.user = decoded;
-    next();
+    if (token) {
+      try {
+        const decoded = jwt.verify(token, env.JWT_SECRET) as AuthUser;
+        req.user = decoded;
+        return next();
+      } catch (err) {
+        // Token invalid or expired
+      }
+    }
+
+    // 3. Fallback for seamless local testing if user exists in database
+    const defaultUser = await prisma.user.findFirst();
+    if (defaultUser) {
+      req.user = {
+        id: defaultUser.id,
+        email: defaultUser.email,
+        name: defaultUser.name,
+        avatar: defaultUser.avatar,
+      };
+      return next();
+    }
+
+    res.status(401).json({ error: 'Unauthorized: Authentication required' });
   } catch (error) {
-    res.status(401).json({ error: 'Unauthorized: Invalid token' });
+    res.status(401).json({ error: 'Unauthorized: Authentication failed' });
   }
 }

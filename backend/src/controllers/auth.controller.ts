@@ -1,61 +1,27 @@
 import { Request, Response } from 'express';
-import { OAuth2Client } from 'google-auth-library';
 import jwt from 'jsonwebtoken';
 import { prisma } from '../db/prisma.js';
 import { env } from '../config/env.js';
 import { AuthenticatedRequest } from '../middleware/auth.js';
 
-const googleClient = new OAuth2Client(env.GOOGLE_CLIENT_ID);
+export function setTokenCookie(res: Response, token: string) {
+  res.cookie('token', token, {
+    httpOnly: true,
+    secure: env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+    path: '/',
+  });
+}
 
-export async function googleLogin(req: Request, res: Response): Promise<void> {
+// Passport Google OAuth callback handler
+export async function handleGoogleOAuthSuccess(req: Request, res: Response): Promise<void> {
   try {
-    const { credential, accessToken } = req.body;
-
-    let email = '';
-    let name = 'User';
-    let avatar = '';
-    let googleId = '';
-
-    if (credential) {
-      // Verify Google ID Token (from Google One-Tap or Google Identity Services button)
-      const ticket = await googleClient.verifyIdToken({
-        idToken: credential,
-        audience: env.GOOGLE_CLIENT_ID,
-      });
-      const payload = ticket.getPayload();
-      if (!payload || !payload.email) {
-        res.status(400).json({ error: 'Invalid Google token payload' });
-        return;
-      }
-      email = payload.email;
-      name = payload.name || payload.given_name || 'User';
-      avatar = payload.picture || '';
-      googleId = payload.sub;
-    } else if (accessToken) {
-      // Access token flow: fetch userinfo from Google
-      const userInfoRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
-        headers: { Authorization: `Bearer ${accessToken}` },
-      });
-      const userInfo = (await userInfoRes.json()) as any;
-      if (!userInfo?.email) {
-        res.status(400).json({ error: 'Failed to fetch user info from Google' });
-        return;
-      }
-      email = userInfo.email;
-      name = userInfo.name || 'User';
-      avatar = userInfo.picture || '';
-      googleId = userInfo.sub;
-    } else {
-      res.status(400).json({ error: 'Missing credential or accessToken' });
+    const user = req.user as any;
+    if (!user) {
+      res.redirect(`${env.FRONTEND_URL}/login?error=auth_failed`);
       return;
     }
-
-    // Upsert User
-    const user = await prisma.user.upsert({
-      where: { email },
-      update: { name, avatar, googleId },
-      create: { email, name, avatar, googleId },
-    });
 
     const token = jwt.sign(
       { id: user.id, email: user.email, name: user.name, avatar: user.avatar },
@@ -63,21 +29,15 @@ export async function googleLogin(req: Request, res: Response): Promise<void> {
       { expiresIn: '7d' }
     );
 
-    res.json({
-      user: {
-        id: user.id,
-        email: user.email,
-        name: user.name,
-        avatar: user.avatar,
-      },
-      token,
-    });
+    setTokenCookie(res, token);
+    res.redirect(`${env.FRONTEND_URL}/dashboard`);
   } catch (error) {
-    console.error('Google login error:', error);
-    res.status(500).json({ error: 'Failed to authenticate with Google' });
+    console.error('Error in Google OAuth callback handler:', error);
+    res.redirect(`${env.FRONTEND_URL}/login?error=oauth_error`);
   }
 }
 
+// Direct email login (matching Figma design's email login option)
 export async function directLogin(req: Request, res: Response): Promise<void> {
   try {
     const { email } = req.body;
@@ -103,6 +63,8 @@ export async function directLogin(req: Request, res: Response): Promise<void> {
       { expiresIn: '7d' }
     );
 
+    setTokenCookie(res, token);
+
     res.json({
       user: {
         id: user.id,
@@ -117,6 +79,7 @@ export async function directLogin(req: Request, res: Response): Promise<void> {
   }
 }
 
+// GET /auth/me -> Returns current user info and Slack connection status
 export async function getCurrentUser(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
     if (!req.user) {
@@ -148,4 +111,15 @@ export async function getCurrentUser(req: AuthenticatedRequest, res: Response): 
   } catch (error) {
     res.status(500).json({ error: 'Failed to retrieve user' });
   }
+}
+
+// POST /auth/logout -> Clears httpOnly JWT cookie
+export async function logout(req: Request, res: Response): Promise<void> {
+  res.clearCookie('token', {
+    httpOnly: true,
+    secure: env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    path: '/',
+  });
+  res.json({ success: true, message: 'Logged out successfully' });
 }

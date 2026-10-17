@@ -4,6 +4,9 @@ import { createBullBoard } from '@bull-board/api';
 import { BullMQAdapter } from '@bull-board/api/bullMQAdapter';
 import { ExpressAdapter } from '@bull-board/express';
 
+import cookieParser from 'cookie-parser';
+import passport from './config/passport.js';
+
 import { env } from './config/env.js';
 import { prisma } from './db/prisma.js';
 import { emailQueue, redisConnection } from './queues/email.queue.js';
@@ -25,6 +28,8 @@ app.use(
     credentials: true,
   })
 );
+app.use(cookieParser());
+app.use(passport.initialize());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
