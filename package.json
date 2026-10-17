@@ -3,10 +3,17 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
+    "start": "concurrently -n \"backend,frontend\" -c \"blue,green\" \"npm run dev --prefix backend\" \"npm run dev --prefix frontend\"",
+    "dev": "concurrently -n \"backend,frontend\" -c \"blue,green\" \"npm run dev --prefix backend\" \"npm run dev --prefix frontend\"",
     "backend:dev": "npm run dev --prefix backend",
+    "frontend:dev": "npm run dev --prefix frontend",
     "docker:up": "docker compose up -d",
     "docker:down": "docker compose down",
     "db:push": "npm run prisma:push --prefix backend",
-    "db:seed": "npm run seed --prefix backend"
+    "db:seed": "npm run seed --prefix backend",
+    "load-test": "npm run load-test --prefix backend"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
   }
 }
