@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   ArrowLeft,
   Clock,
@@ -12,6 +12,9 @@ import {
   List,
   Quote,
   Code,
+  CheckCircle2,
+  Calendar,
+  X,
 } from 'lucide-react';
 import Papa from 'papaparse';
 import type { Sender } from '../types';
@@ -25,26 +28,29 @@ interface ComposeModalProps {
   onSuccess: () => void;
 }
 
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
 export const ComposeModal: React.FC<ComposeModalProps> = ({
   isOpen,
   onClose,
   onSuccess,
 }) => {
   const { success, error } = useToast();
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const [senders, setSenders] = useState<Sender[]>([]);
   const [selectedSenderId, setSelectedSenderId] = useState<string>('');
   const [toInput, setToInput] = useState<string>('');
   const [recipientList, setRecipientList] = useState<string[]>([]);
+  const [detectedCount, setDetectedCount] = useState<number>(0);
   const [subject, setSubject] = useState<string>('');
   const [body, setBody] = useState<string>('');
+  const [startTime, setStartTime] = useState<string>('');
   const [delayBetweenSeconds, setDelayBetweenSeconds] = useState<number>(2);
   const [hourlyLimit, setHourlyLimit] = useState<number>(200);
 
   // Send Later Popover state
   const [showSendLater, setShowSendLater] = useState<boolean>(false);
-  const [scheduledDateTime, setScheduledDateTime] = useState<string>('');
-
   const [loading, setLoading] = useState<boolean>(false);
 
   useEffect(() => {
@@ -55,20 +61,41 @@ export const ComposeModal: React.FC<ComposeModalProps> = ({
           setSelectedSenderId(res.senders[0].id);
         }
       });
+      // Default startTime to current time
+      const nowStr = new Date().toISOString().slice(0, 16);
+      if (!startTime) setStartTime(nowStr);
     }
   }, [isOpen]);
 
   if (!isOpen) return null;
 
-  const handleAddRecipient = (val: string) => {
-    const raw = val.split(/[,;\s]+/).map((s) => s.trim()).filter((s) => s.includes('@'));
-    const unique = Array.from(new Set([...recipientList, ...raw]));
-    setRecipientList(unique);
+  const parseAndAddEmails = (rawInputs: string[]) => {
+    const validEmails: string[] = [];
+    rawInputs.forEach((entry) => {
+      const candidates = entry.split(/[,;\s\r\n]+/).map((s) => s.trim().toLowerCase());
+      candidates.forEach((email) => {
+        if (email && EMAIL_REGEX.test(email)) {
+          validEmails.push(email);
+        }
+      });
+    });
+
+    // Dedupe
+    const combined = Array.from(new Set([...recipientList, ...validEmails]));
+    setRecipientList(combined);
+    setDetectedCount(combined.length);
     setToInput('');
   };
 
+  const handleManualAdd = (val: string) => {
+    if (!val.trim()) return;
+    parseAndAddEmails([val]);
+  };
+
   const handleRemoveRecipient = (emailToRemove: string) => {
-    setRecipientList(recipientList.filter((e) => e !== emailToRemove));
+    const updated = recipientList.filter((e) => e !== emailToRemove);
+    setRecipientList(updated);
+    setDetectedCount(updated.length);
   };
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -77,29 +104,25 @@ export const ComposeModal: React.FC<ComposeModalProps> = ({
 
     Papa.parse(file, {
       complete: (results) => {
-        const extractedEmails: string[] = [];
+        const extracted: string[] = [];
         results.data.forEach((row: any) => {
           if (Array.isArray(row)) {
             row.forEach((cell) => {
-              if (typeof cell === 'string' && cell.includes('@') && cell.includes('.')) {
-                extractedEmails.push(cell.trim());
-              }
+              if (typeof cell === 'string') extracted.push(cell);
             });
           } else if (typeof row === 'object' && row !== null) {
             Object.values(row).forEach((val) => {
-              if (typeof val === 'string' && val.includes('@') && val.includes('.')) {
-                extractedEmails.push(val.trim());
-              }
+              if (typeof val === 'string') extracted.push(val);
             });
           }
         });
 
-        const unique = Array.from(new Set([...recipientList, ...extractedEmails]));
-        setRecipientList(unique);
-        success(`Parsed ${extractedEmails.length} email addresses from file`);
+        parseAndAddEmails(extracted);
+        if (fileInputRef.current) fileInputRef.current.value = '';
+        success(`Parsed file: ${extracted.length} raw rows processed.`);
       },
       error: () => {
-        error('Failed to parse lead file');
+        error('Failed to parse lead file. Please ensure it is a valid CSV or TXT file.');
       },
     });
   };
@@ -113,49 +136,52 @@ export const ComposeModal: React.FC<ComposeModalProps> = ({
       target.setMinutes(target.getMinutes() + offsetMinutes);
     }
     const isoString = target.toISOString().slice(0, 16);
-    setScheduledDateTime(isoString);
+    setStartTime(isoString);
   };
 
-  const handleSendOrSchedule = async () => {
+  const handleScheduleSubmit = async () => {
+    // Collect any remaining text in toInput
     let finalEmails = [...recipientList];
-    if (toInput.trim().includes('@')) {
-      finalEmails = Array.from(new Set([...finalEmails, toInput.trim()]));
+    if (toInput.trim()) {
+      const candidates = toInput.split(/[,;\s]+/).map((s) => s.trim().toLowerCase()).filter((s) => EMAIL_REGEX.test(s));
+      finalEmails = Array.from(new Set([...finalEmails, ...candidates]));
     }
 
     if (finalEmails.length === 0) {
-      error('Please specify at least one recipient email address');
+      error('Please provide at least one valid recipient email address.');
       return;
     }
 
     if (!subject.trim()) {
-      error('Please enter an email subject');
+      error('Please enter an email subject.');
       return;
     }
 
     if (!body.trim()) {
-      error('Please write an email message');
+      error('Please write an email message body.');
       return;
     }
 
     try {
       setLoading(true);
-      const targetTime = scheduledDateTime ? new Date(scheduledDateTime).toISOString() : new Date().toISOString();
+      const scheduledIso = startTime ? new Date(startTime).toISOString() : new Date().toISOString();
 
       await emailApi.schedule({
         emails: finalEmails,
         subject,
         body: `<div style="font-family: sans-serif; line-height: 1.6;">${body.replace(/\n/g, '<br/>')}</div>`,
-        startTime: targetTime,
+        startTime: scheduledIso,
         delayBetweenMs: delayBetweenSeconds * 1000,
         hourlyLimit,
-        senderId: selectedSenderId,
+        senderId: selectedSenderId || undefined,
       });
 
-      success(`Scheduled ${finalEmails.length} email(s) successfully!`);
+      success(`Successfully scheduled ${finalEmails.length} email(s)!`);
       onSuccess();
       onClose();
     } catch (err: any) {
-      error(err.response?.data?.error || 'Failed to schedule emails');
+      const msg = err.response?.data?.error || err.message || 'Failed to schedule emails';
+      error(msg);
     } finally {
       setLoading(false);
     }
@@ -185,15 +211,15 @@ export const ComposeModal: React.FC<ComposeModalProps> = ({
                 type="button"
                 onClick={() => setShowSendLater(!showSendLater)}
                 className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs font-semibold transition-all ${
-                  scheduledDateTime
+                  startTime
                     ? 'border-emerald-600 bg-emerald-50 text-emerald-700'
                     : 'border-slate-300 hover:bg-slate-50 text-slate-700'
                 }`}
               >
                 <Clock className="w-4 h-4 text-emerald-600" />
                 <span>
-                  {scheduledDateTime
-                    ? `Send at ${new Date(scheduledDateTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
+                  {startTime
+                    ? `Starts: ${new Date(startTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
                     : 'Schedule Later'}
                 </span>
               </button>
@@ -206,8 +232,8 @@ export const ComposeModal: React.FC<ComposeModalProps> = ({
                   </h4>
                   <input
                     type="datetime-local"
-                    value={scheduledDateTime}
-                    onChange={(e) => setScheduledDateTime(e.target.value)}
+                    value={startTime}
+                    onChange={(e) => setStartTime(e.target.value)}
                     className="w-full text-xs p-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-500 mb-3"
                   />
 
@@ -241,20 +267,17 @@ export const ComposeModal: React.FC<ComposeModalProps> = ({
                   <div className="flex justify-end gap-2 border-t pt-2">
                     <button
                       type="button"
-                      onClick={() => {
-                        setScheduledDateTime('');
-                        setShowSendLater(false);
-                      }}
+                      onClick={() => setShowSendLater(false)}
                       className="text-xs text-slate-500 hover:text-slate-800 px-2 py-1"
                     >
-                      Clear
+                      Close
                     </button>
                     <Button
                       size="sm"
                       variant="primary"
                       onClick={() => setShowSendLater(false)}
                     >
-                      Done
+                      Apply
                     </Button>
                   </div>
                 </div>
@@ -263,11 +286,11 @@ export const ComposeModal: React.FC<ComposeModalProps> = ({
 
             <Button
               variant="primary"
-              onClick={handleSendOrSchedule}
+              onClick={handleScheduleSubmit}
               loading={loading}
               icon={<Send className="w-4 h-4" />}
             >
-              {scheduledDateTime ? 'Schedule Email' : 'Send Now'}
+              Schedule
             </Button>
           </div>
         </div>
@@ -276,7 +299,7 @@ export const ComposeModal: React.FC<ComposeModalProps> = ({
         <div className="p-6 space-y-4">
           {/* From Selector */}
           <div className="flex items-center gap-3">
-            <label className="w-16 text-xs font-semibold text-slate-500">
+            <label className="w-20 text-xs font-semibold text-slate-500">
               From
             </label>
             <select
@@ -292,30 +315,59 @@ export const ComposeModal: React.FC<ComposeModalProps> = ({
             </select>
           </div>
 
-          {/* To Field with CSV upload */}
+          {/* To Field with CSV upload & detected banner */}
           <div className="flex items-start gap-3">
-            <label className="w-16 text-xs font-semibold text-slate-500 pt-2">
+            <label className="w-20 text-xs font-semibold text-slate-500 pt-2">
               To
             </label>
-            <div className="flex-1 border border-slate-200 rounded-xl p-2 bg-white focus-within:ring-2 focus-within:ring-emerald-500 focus-within:border-emerald-500 transition-all">
-              <div className="flex flex-wrap items-center gap-1.5 mb-1.5">
-                {recipientList.map((rec) => (
-                  <span
-                    key={rec}
-                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-medium bg-emerald-50 text-emerald-800 border border-emerald-200"
+            <div className="flex-1 border border-slate-200 rounded-xl p-2.5 bg-white focus-within:ring-2 focus-within:ring-emerald-500 focus-within:border-emerald-500 transition-all">
+              {/* Detected Badge */}
+              {detectedCount > 0 && (
+                <div className="flex items-center justify-between mb-2 px-2.5 py-1.5 rounded-lg bg-emerald-50 border border-emerald-200">
+                  <div className="flex items-center gap-1.5 text-xs font-semibold text-emerald-800">
+                    <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                    <span>{detectedCount} email addresses detected</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setRecipientList([]);
+                      setDetectedCount(0);
+                    }}
+                    className="text-[11px] text-slate-500 hover:text-rose-600 font-medium"
                   >
-                    <span>{rec}</span>
-                    <button
-                      type="button"
-                      onClick={() => handleRemoveRecipient(rec)}
-                      className="hover:text-rose-600"
-                    >
-                      &times;
-                    </button>
-                  </span>
-                ))}
-              </div>
+                    Clear all
+                  </button>
+                </div>
+              )}
 
+              {/* Recipient Chips */}
+              {recipientList.length > 0 && (
+                <div className="flex flex-wrap items-center gap-1.5 mb-2 max-h-28 overflow-y-auto p-1">
+                  {recipientList.slice(0, 50).map((rec) => (
+                    <span
+                      key={rec}
+                      className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-medium bg-slate-100 text-slate-800 border border-slate-200"
+                    >
+                      <span>{rec}</span>
+                      <button
+                        type="button"
+                        onClick={() => handleRemoveRecipient(rec)}
+                        className="text-slate-400 hover:text-rose-600"
+                      >
+                        <X className="w-3 h-3" />
+                      </button>
+                    </span>
+                  ))}
+                  {recipientList.length > 50 && (
+                    <span className="text-xs text-slate-500 font-medium px-2 py-0.5">
+                      +{recipientList.length - 50} more
+                    </span>
+                  )}
+                </div>
+              )}
+
+              {/* Input + CSV Upload Button */}
               <div className="flex items-center gap-2">
                 <input
                   type="text"
@@ -324,24 +376,25 @@ export const ComposeModal: React.FC<ComposeModalProps> = ({
                   onKeyDown={(e) => {
                     if (e.key === 'Enter' || e.key === ',') {
                       e.preventDefault();
-                      handleAddRecipient(toInput);
+                      handleManualAdd(toInput);
                     }
                   }}
                   onBlur={() => {
-                    if (toInput.trim()) handleAddRecipient(toInput);
+                    if (toInput.trim()) handleManualAdd(toInput);
                   }}
                   placeholder={
                     recipientList.length === 0
                       ? 'recipient@example.com (comma separated or enter)'
                       : 'Add more recipients...'
                   }
-                  className="flex-1 text-sm border-none focus:outline-none px-1 text-slate-800"
+                  className="flex-1 text-sm border-none focus:outline-none px-1 text-slate-800 placeholder-slate-400"
                 />
 
-                <label className="cursor-pointer inline-flex items-center gap-1 text-xs font-semibold text-emerald-700 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded-lg px-2.5 py-1 transition-colors">
+                <label className="cursor-pointer inline-flex items-center gap-1 text-xs font-semibold text-emerald-700 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded-lg px-3 py-1.5 transition-colors shadow-sm">
                   <Upload className="w-3.5 h-3.5" />
-                  <span>Upload CSV</span>
+                  <span>Upload CSV/Text</span>
                   <input
+                    ref={fileInputRef}
                     type="file"
                     accept=".csv,.txt"
                     onChange={handleFileUpload}
@@ -354,7 +407,7 @@ export const ComposeModal: React.FC<ComposeModalProps> = ({
 
           {/* Subject Field */}
           <div className="flex items-center gap-3">
-            <label className="w-16 text-xs font-semibold text-slate-500">
+            <label className="w-20 text-xs font-semibold text-slate-500">
               Subject
             </label>
             <input
@@ -366,44 +419,62 @@ export const ComposeModal: React.FC<ComposeModalProps> = ({
             />
           </div>
 
-          {/* Inline Throttling Settings: Delay & Hourly Limit */}
-          <div className="flex items-center gap-6 py-2 px-3 bg-slate-50 rounded-xl border border-slate-100">
-            <div className="flex items-center gap-2">
-              <label className="text-xs font-semibold text-slate-600">
-                Delay between 2 emails:
+          {/* Scheduling Controls: Start Time, Delay, Hourly Limit */}
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 p-3.5 bg-slate-50 rounded-xl border border-slate-100">
+            {/* Start Time */}
+            <div>
+              <label className="block text-[11px] font-semibold text-slate-500 uppercase tracking-wider mb-1">
+                Start Time
               </label>
-              <div className="flex items-center gap-1">
+              <div className="relative">
+                <Calendar className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                <input
+                  type="datetime-local"
+                  value={startTime}
+                  onChange={(e) => setStartTime(e.target.value)}
+                  className="w-full text-xs font-medium pl-8 pr-2 py-1.5 border border-slate-300 rounded-lg text-slate-800 bg-white focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                />
+              </div>
+            </div>
+
+            {/* Delay Between Emails */}
+            <div>
+              <label className="block text-[11px] font-semibold text-slate-500 uppercase tracking-wider mb-1">
+                Delay Between Emails
+              </label>
+              <div className="flex items-center gap-1.5">
                 <input
                   type="number"
                   min="0"
                   max="3600"
                   value={delayBetweenSeconds}
                   onChange={(e) => setDelayBetweenSeconds(Number(e.target.value))}
-                  className="w-14 text-center text-xs font-bold border border-slate-300 rounded-lg py-1 text-slate-800 bg-white"
+                  className="w-full text-xs font-bold border border-slate-300 rounded-lg p-1.5 text-slate-800 bg-white text-center focus:outline-none focus:ring-2 focus:ring-emerald-500"
                 />
-                <span className="text-xs text-slate-500">sec</span>
+                <span className="text-xs text-slate-500 font-medium">sec</span>
               </div>
             </div>
 
-            <div className="flex items-center gap-2">
-              <label className="text-xs font-semibold text-slate-600">
-                Hourly Limit:
+            {/* Hourly Limit */}
+            <div>
+              <label className="block text-[11px] font-semibold text-slate-500 uppercase tracking-wider mb-1">
+                Hourly Limit
               </label>
-              <div className="flex items-center gap-1">
+              <div className="flex items-center gap-1.5">
                 <input
                   type="number"
                   min="1"
                   max="10000"
                   value={hourlyLimit}
                   onChange={(e) => setHourlyLimit(Number(e.target.value))}
-                  className="w-16 text-center text-xs font-bold border border-slate-300 rounded-lg py-1 text-slate-800 bg-white"
+                  className="w-full text-xs font-bold border border-slate-300 rounded-lg p-1.5 text-slate-800 bg-white text-center focus:outline-none focus:ring-2 focus:ring-emerald-500"
                 />
-                <span className="text-xs text-slate-500">/hr</span>
+                <span className="text-xs text-slate-500 font-medium">/hr</span>
               </div>
             </div>
           </div>
 
-          {/* Editor Toolbar */}
+          {/* Editor Toolbar & Body Area */}
           <div className="border border-slate-200 rounded-xl overflow-hidden focus-within:border-emerald-500 focus-within:ring-2 focus-within:ring-emerald-100 transition-all">
             <div className="flex items-center gap-1 p-2 bg-slate-50/80 border-b border-slate-200 text-slate-600">
               <button

@@ -9,34 +9,31 @@ import {
   Star,
   ExternalLink,
   ChevronDown,
-  CheckCircle2,
 } from 'lucide-react';
 import { useAuth } from '../hooks/useAuth';
 import { useToast } from '../components/ui/Toast';
-import { emailApi, slackApi, API_BASE_URL } from '../api/client';
+import { emailApi, API_BASE_URL } from '../api/client';
 import type { EmailJob, EmailStats } from '../types';
 import { ComposeModal } from '../components/ComposeModal';
 import { EmailDetailModal } from '../components/EmailDetailModal';
+import { SlackHeaderChip } from '../components/SlackHeaderChip';
 import { Table } from '../components/ui/Table';
 import type { Column } from '../components/ui/Table';
 import { EmptyState } from '../components/ui/EmptyState';
 import { Button } from '../components/ui/Button';
-
-const SlackIcon = () => (
-  <svg className="w-4 h-4 text-[#4A154B]" viewBox="0 0 24 24" fill="currentColor">
-    <path d="M5.042 15.165a2.528 2.528 0 0 1-2.52 2.523A2.528 2.528 0 0 1 0 15.165a2.527 2.527 0 0 1 2.522-2.52h2.52v2.52zM6.313 15.165a2.527 2.527 0 0 1 2.521-2.52 2.527 2.527 0 0 1 2.521 2.52v6.313A2.528 2.528 0 0 1 8.834 24a2.528 2.528 0 0 1-2.521-2.522v-6.313zM8.834 5.042a2.528 2.528 0 0 1-2.521-2.52A2.528 2.528 0 0 1 8.834 0a2.528 2.528 0 0 1 2.521 2.522v2.52H8.834zM8.834 6.313a2.528 2.528 0 0 1 2.521 2.521 2.528 2.528 0 0 1-2.521 2.521H2.522A2.528 2.528 0 0 1 0 8.834a2.528 2.528 0 0 1 2.522-2.521h6.312zM18.956 8.834a2.528 2.528 0 0 1 2.522-2.521A2.528 2.528 0 0 1 24 8.834a2.528 2.528 0 0 1-2.522 2.521h-2.522V8.834zM17.688 8.834a2.528 2.528 0 0 1-2.523 2.521 2.527 2.527 0 0 1-2.52-2.521V2.522A2.527 2.527 0 0 1 15.165 0a2.528 2.528 0 0 1 2.523 2.522v6.312zM15.165 18.956a2.528 2.528 0 0 1 2.523 2.522A2.528 2.528 0 0 1 15.165 24a2.527 2.527 0 0 1-2.52-2.522v-2.522h2.52zM15.165 17.688a2.527 2.527 0 0 1-2.52-2.523 2.526 2.526 0 0 1 2.52-2.52h6.313A2.527 2.527 0 0 1 24 15.165a2.528 2.528 0 0 1-2.522 2.523h-6.313z" />
-  </svg>
-);
+import { useDebounce } from '../hooks/useDebounce';
 
 export const DashboardPage: React.FC = () => {
-  const { user, logout, slackConnected, slackChannel, refreshUser } = useAuth();
-  const { success, error } = useToast();
+  const { user, logout, refreshUser } = useAuth();
+  const { error } = useToast();
 
   const [activeTab, setActiveTab] = useState<'scheduled' | 'sent'>('scheduled');
   const [emails, setEmails] = useState<EmailJob[]>([]);
   const [stats, setStats] = useState<EmailStats>({ scheduled: 0, sent: 0 });
   const [loading, setLoading] = useState<boolean>(true);
+  const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
   const [searchQuery, setSearchQuery] = useState<string>('');
+  const debouncedSearch = useDebounce(searchQuery, 350);
   const [page, setPage] = useState<number>(1);
   const [totalPages, setTotalPages] = useState<number>(1);
 
@@ -57,62 +54,67 @@ export const DashboardPage: React.FC = () => {
     });
   };
 
-  const fetchData = useCallback(async () => {
-    try {
-      setLoading(true);
-      // Fetch stats
-      const statsData = await emailApi.getStats();
-      setStats(statsData);
+  const fetchData = useCallback(
+    async (isBackground = false) => {
+      try {
+        if (!isBackground) {
+          setLoading(true);
+        } else {
+          setIsRefreshing(true);
+        }
 
-      // Fetch emails based on activeTab and search
-      if (searchQuery.trim()) {
-        const searchRes = await emailApi.search(
-          searchQuery.trim(),
-          activeTab,
-          page,
-          15
-        );
-        setEmails(searchRes.emails);
-        setTotalPages(searchRes.totalPages || 1);
-      } else if (activeTab === 'scheduled') {
-        const schedRes = await emailApi.getScheduled(page, 15);
-        setEmails(schedRes.emails);
-        setTotalPages(schedRes.totalPages || 1);
-      } else {
-        const sentRes = await emailApi.getSent(page, 15);
-        setEmails(sentRes.emails);
-        setTotalPages(sentRes.totalPages || 1);
+        // Fetch stats
+        const statsData = await emailApi.getStats();
+        setStats(statsData);
+
+        // Fetch emails based on activeTab and debounced search
+        if (debouncedSearch.trim()) {
+          const searchRes = await emailApi.search(
+            debouncedSearch.trim(),
+            activeTab,
+            page,
+            15
+          );
+          setEmails(searchRes.emails);
+          setTotalPages(searchRes.totalPages || 1);
+        } else if (activeTab === 'scheduled') {
+          const schedRes = await emailApi.getScheduled(page, 15);
+          setEmails(schedRes.emails);
+          setTotalPages(schedRes.totalPages || 1);
+        } else {
+          const sentRes = await emailApi.getSent(page, 15);
+          setEmails(sentRes.emails);
+          setTotalPages(sentRes.totalPages || 1);
+        }
+      } catch (err: any) {
+        if (!isBackground) {
+          error('Failed to load email jobs');
+        }
+      } finally {
+        if (!isBackground) setLoading(false);
+        setIsRefreshing(false);
       }
-    } catch (err: any) {
-      error('Failed to load email jobs');
-    } finally {
-      setLoading(false);
-    }
-  }, [activeTab, searchQuery, page, error]);
+    },
+    [activeTab, debouncedSearch, page, error]
+  );
 
+  // Fetch when search, tab, or page changes
   useEffect(() => {
     fetchData();
   }, [fetchData]);
 
-  // Handle Slack connection check on query params
+  // Reset page when search or tab changes
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    if (params.get('slack_connected') === 'true') {
-      success('Slack connected successfully! Rate-limit alerts active.');
-      refreshUser();
-      window.history.replaceState({}, document.title, window.location.pathname);
-    }
-  }, [refreshUser, success]);
+    setPage(1);
+  }, [debouncedSearch, activeTab]);
 
-  const handleDisconnectSlack = async () => {
-    try {
-      await slackApi.disconnect();
-      success('Slack disconnected');
-      refreshUser();
-    } catch (err) {
-      error('Failed to disconnect Slack');
-    }
-  };
+  // Auto-refresh tables every 10s (background polling)
+  useEffect(() => {
+    const interval = setInterval(() => {
+      fetchData(true);
+    }, 10000);
+    return () => clearInterval(interval);
+  }, [fetchData]);
 
   // Format date matching Figma (e.g. "Tue 9:15:12 AM")
   const formatScheduledTime = (dateStr: string) => {
@@ -308,52 +310,17 @@ export const DashboardPage: React.FC = () => {
           </div>
         </div>
 
-        {/* BOTTOM SIDEBAR: Slack Connection & Queue Dashboard */}
+        {/* BOTTOM SIDEBAR: BullMQ Monitor */}
         <div className="space-y-3 pt-4 border-t border-slate-100">
-          {/* Slack Connection Card */}
-          <div className="p-3 rounded-xl border border-slate-100 bg-slate-50/80">
-            <div className="flex items-center justify-between mb-2">
-              <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-700">
-                <SlackIcon />
-                <span>Slack Alerts</span>
-              </div>
-              {slackConnected && (
-                <span className="flex items-center gap-1 text-[10px] text-emerald-600 font-bold bg-emerald-50 px-1.5 py-0.5 rounded">
-                  <CheckCircle2 className="w-3 h-3" /> Live
-                </span>
-              )}
-            </div>
-
-            {slackConnected ? (
-              <div className="text-xs text-slate-500 flex items-center justify-between">
-                <span className="truncate">#{slackChannel || 'alerts'}</span>
-                <button
-                  onClick={handleDisconnectSlack}
-                  className="text-xs text-rose-600 hover:underline font-medium"
-                >
-                  Disconnect
-                </button>
-              </div>
-            ) : (
-              <a
-                href={slackApi.getConnectUrl()}
-                className="w-full inline-flex items-center justify-center gap-1.5 text-xs font-semibold bg-emerald-600 hover:bg-emerald-700 text-white py-1.5 px-3 rounded-lg shadow-sm transition-all text-center"
-              >
-                Connect Slack
-              </a>
-            )}
-          </div>
-
-          {/* BullMQ Live Monitor */}
           <a
             href={`${API_BASE_URL}/admin/queues`}
             target="_blank"
             rel="noreferrer"
-            className="flex items-center justify-between p-2.5 rounded-xl border border-slate-200 text-xs font-medium text-slate-700 hover:bg-slate-50 transition-colors"
+            className="flex items-center justify-between p-2.5 rounded-xl border border-slate-200 text-xs font-semibold text-slate-700 hover:bg-slate-50 transition-colors shadow-sm"
           >
             <div className="flex items-center gap-2">
               <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-              <span>BullMQ Monitor</span>
+              <span>BullMQ Queue UI</span>
             </div>
             <ExternalLink className="w-3.5 h-3.5 text-slate-400" />
           </a>
@@ -364,37 +331,33 @@ export const DashboardPage: React.FC = () => {
       <main className="flex-1 flex flex-col min-w-0 overflow-y-auto">
         {/* Top Header */}
         <header className="h-16 bg-white border-b border-slate-200 flex items-center justify-between px-8 flex-shrink-0">
-          {/* Search Bar with Elasticsearch integration */}
-          <div className="relative w-96">
-            <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
-            <input
-              type="text"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search emails via Elasticsearch..."
-              className="w-full pl-9 pr-8 py-2 text-sm bg-slate-50 border border-slate-200 rounded-full focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:bg-white transition-all text-slate-800 placeholder-slate-400"
-            />
-            {searchQuery && (
-              <button
-                onClick={() => setSearchQuery('')}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-slate-400 hover:text-slate-600"
-              >
-                &times;
-              </button>
-            )}
+          {/* Left Header: Breadcrumbs / Mode */}
+          <div className="flex items-center gap-3">
+            <span className="text-xs font-bold uppercase tracking-wider text-slate-400">
+              Workspace
+            </span>
+            <span className="text-slate-300">/</span>
+            <span className="text-sm font-semibold text-slate-800">
+              {activeTab === 'scheduled' ? 'Scheduled Queue' : 'Delivered History'}
+            </span>
           </div>
 
-          {/* Right Header: Refresh, User, Logout */}
+          {/* Right Header: Slack Status Chip, Refresh, User, Logout */}
           <div className="flex items-center gap-3">
-            <button
-              onClick={fetchData}
-              title="Refresh"
-              className="p-2 rounded-xl text-slate-500 hover:text-slate-800 hover:bg-slate-100 transition-colors"
-            >
-              <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
-            </button>
+            {/* Real Slack OAuth / Status Chip with Disconnect */}
+            <SlackHeaderChip onStatusChange={refreshUser} />
 
             <div className="h-5 w-px bg-slate-200 mx-1" />
+
+            <button
+              onClick={() => fetchData(false)}
+              title="Refresh Data (Auto-refreshes every 10s)"
+              className="p-2 rounded-xl text-slate-500 hover:text-slate-800 hover:bg-slate-100 transition-colors"
+            >
+              <RefreshCw
+                className={`w-4 h-4 ${loading || isRefreshing ? 'animate-spin text-emerald-600' : ''}`}
+              />
+            </button>
 
             <div className="flex items-center gap-2.5 pl-2">
               <img
@@ -415,7 +378,7 @@ export const DashboardPage: React.FC = () => {
               size="sm"
               onClick={logout}
               icon={<LogOut className="w-4 h-4 text-slate-500" />}
-              className="ml-2 text-slate-600"
+              className="ml-1 text-slate-600"
             >
               Logout
             </Button>
@@ -446,6 +409,36 @@ export const DashboardPage: React.FC = () => {
             >
               Compose New Email
             </Button>
+          </div>
+
+          {/* Search Box Directly Above the Tables (with Debounce) */}
+          <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 mb-4">
+            <div className="relative flex-1 max-w-md">
+              <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder={`Search ${activeTab} emails via Elasticsearch...`}
+                className="w-full pl-9 pr-8 py-2 text-sm bg-white border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 transition-all text-slate-800 placeholder-slate-400 shadow-sm"
+              />
+              {searchQuery && (
+                <button
+                  onClick={() => setSearchQuery('')}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-xs font-bold text-slate-400 hover:text-slate-600 p-0.5"
+                  title="Clear search"
+                >
+                  &times;
+                </button>
+              )}
+            </div>
+
+            <div className="flex items-center gap-2 text-xs text-slate-500">
+              <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-slate-100 border border-slate-200">
+                <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                <span>Auto-refreshes every 10s</span>
+              </span>
+            </div>
           </div>
 
           {/* Email List / Table */}

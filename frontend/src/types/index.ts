@@ -45,6 +45,7 @@ export interface SlackStatus {
   connected: boolean;
   channel: string | null;
   teamName: string | null;
+  connectedAt?: string | null;
 }
 
 export interface PaginatedResponse<T> {

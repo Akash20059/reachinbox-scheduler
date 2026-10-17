@@ -1,0 +1,6 @@
+email,first_name,company
+alex.developer@reachinbox-sample.com,Alex,ReachInbox
+sarah.marketing@reachinbox-sample.com,Sarah,GrowthCo
+david.sales@reachinbox-sample.com,David,CloudTech
+alex.developer@reachinbox-sample.com,DuplicateAlex,ReachInbox
+invalid-email-address,InvalidUser,None
