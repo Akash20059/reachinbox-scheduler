@@ -2,6 +2,7 @@ services:
   # Backend Web Service
   - type: web
     name: reachinbox-backend
+    plan: free
     env: node
     rootDir: backend
     buildCommand: npm install && npx prisma generate && npm run build
@@ -32,14 +33,12 @@ services:
           name: reachinbox-postgres
           property: connectionString
       - key: REDIS_URL
-        fromService:
-          type: redis
-          name: reachinbox-redis
-          property: connectionString
+        sync: false
 
   # Frontend Static Site
   - type: web
     name: reachinbox-frontend
+    plan: free
     env: static
     rootDir: frontend
     buildCommand: npm install && npm run build
@@ -57,5 +56,7 @@ services:
 
 databases:
   - name: reachinbox-postgres
+    plan: free
     databaseName: reachinbox_scheduler
     user: reachinbox
+
