@@ -1,0 +1,12 @@
+{
+  "name": "reachinbox-scheduler-monorepo",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "backend:dev": "npm run dev --prefix backend",
+    "docker:up": "docker compose up -d",
+    "docker:down": "docker compose down",
+    "db:push": "npm run prisma:push --prefix backend",
+    "db:seed": "npm run seed --prefix backend"
+  }
+}
