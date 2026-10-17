@@ -1,0 +1,61 @@
+services:
+  # Backend Web Service
+  - type: web
+    name: reachinbox-backend
+    env: node
+    rootDir: backend
+    buildCommand: npm install && npx prisma generate && npm run build
+    startCommand: npx prisma db push && npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: WORKER_CONCURRENCY
+        value: 5
+      - key: MIN_DELAY_BETWEEN_EMAILS_MS
+        value: 2000
+      - key: MAX_EMAILS_PER_HOUR_PER_SENDER
+        value: 200
+      - key: MAX_HOURLY_LIMIT_ALLOWED
+        value: 5000
+      - key: MAX_DELAY_ALLOWED_MS
+        value: 3600000
+      - key: BULL_BOARD_USER
+        value: admin
+      - key: BULL_BOARD_PASS
+        generateValue: true
+      - key: JWT_SECRET
+        generateValue: true
+      - key: DATABASE_URL
+        fromDatabase:
+          name: reachinbox-postgres
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: reachinbox-redis
+          property: connectionString
+
+  # Frontend Static Site
+  - type: web
+    name: reachinbox-frontend
+    env: static
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    envVars:
+      - key: VITE_BACKEND_URL
+        fromService:
+          type: web
+          name: reachinbox-backend
+          property: host
+
+databases:
+  - name: reachinbox-postgres
+    databaseName: reachinbox_scheduler
+    user: reachinbox
