@@ -39,7 +39,11 @@ createBullBoard({
 
 app.use('/admin/queues', serverAdapter.getRouter());
 
-// Routes
+// Routes (supporting both /api/... and top-level endpoints)
+app.use('/api', emailRoutes);
+app.use('/api/auth', authRoutes);
+app.use('/api/slack', slackRoutes);
+
 app.use('/auth', authRoutes);
 app.use('/emails', emailRoutes);
 app.use('/slack', slackRoutes);

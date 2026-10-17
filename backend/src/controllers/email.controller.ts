@@ -1,4 +1,5 @@
-import { Response } from 'express';
+import { Request, Response } from 'express';
+import { z } from 'zod';
 import { randomUUID } from 'crypto';
 import { prisma } from '../db/prisma.js';
 import { AuthenticatedRequest } from '../middleware/auth.js';
@@ -6,82 +7,109 @@ import { scheduleEmailInQueue } from '../queues/email.queue.js';
 import { indexEmailJob, searchEmailsInES } from '../services/elasticsearch.js';
 import { env } from '../config/env.js';
 
+// 1. Zod validation schema for POST /api/schedule
+const scheduleRequestSchema = z.object({
+  subject: z.string().min(1, 'Subject is required'),
+  body: z.string().min(1, 'Body is required'),
+  emails: z
+    .array(z.string().email('Invalid email address format'))
+    .min(1, 'At least one recipient email address is required'),
+  startTime: z
+    .string()
+    .datetime({ offset: true })
+    .or(z.string())
+    .optional(),
+  delayBetweenMs: z.number().min(0).optional(),
+  hourlyLimit: z.number().positive().optional(),
+  senderId: z.string().optional(),
+});
+
 export async function scheduleEmails(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
-    const {
-      senderId,
-      to,
-      subject,
-      body,
-      scheduledAt,
-      delayBetweenEmailsMs,
-      hourlyLimit,
-    } = req.body;
+    // Also accept 'to' as fallback alias for emails
+    const requestBody = { ...req.body };
+    if (!requestBody.emails && requestBody.to) {
+      requestBody.emails = Array.isArray(requestBody.to) ? requestBody.to : [requestBody.to];
+    }
 
-    if (!to || (!Array.isArray(to) && typeof to !== 'string')) {
-      res.status(400).json({ error: 'Recipient email(s) ("to") is required.' });
+    const validationResult = scheduleRequestSchema.safeParse(requestBody);
+    if (!validationResult.success) {
+      res.status(400).json({
+        error: 'Validation failed',
+        details: validationResult.error.flatten().fieldErrors,
+      });
       return;
     }
 
-    if (!subject || !body) {
-      res.status(400).json({ error: 'Subject and Body are required.' });
+    const { subject, body, emails, startTime, delayBetweenMs, hourlyLimit, senderId } =
+      validationResult.data;
+
+    // Fetch senders from Sender table
+    let senders = await prisma.sender.findMany({
+      orderBy: { createdAt: 'asc' },
+    });
+
+    if (senders.length === 0) {
+      res.status(400).json({ error: 'No senders found in the Sender table.' });
       return;
     }
 
-    // Determine sender
-    let sender = null;
+    // If specific senderId requested, filter or prioritize
     if (senderId) {
-      sender = await prisma.sender.findUnique({ where: { id: senderId } });
-    }
-    if (!sender) {
-      sender = await prisma.sender.findFirst();
-    }
-    if (!sender) {
-      res.status(400).json({ error: 'No email senders configured in system.' });
-      return;
+      const specificSender = senders.find((s) => s.id === senderId);
+      if (specificSender) {
+        senders = [specificSender];
+      }
     }
 
-    const recipients = Array.isArray(to) ? to : [to];
-    const cleanRecipients = recipients
-      .map((r: string) => r.trim())
-      .filter((r: string) => r.length > 0 && r.includes('@'));
-
-    if (cleanRecipients.length === 0) {
-      res.status(400).json({ error: 'No valid recipient email addresses provided.' });
-      return;
-    }
-
-    const baseScheduledTime = scheduledAt ? new Date(scheduledAt) : new Date();
-    const delayStep = Number(delayBetweenEmailsMs) >= 0 ? Number(delayBetweenEmailsMs) : env.MIN_DELAY_BETWEEN_EMAILS_MS;
+    const baseScheduledTime = startTime ? new Date(startTime) : new Date();
+    const delayStep =
+      delayBetweenMs !== undefined ? delayBetweenMs : env.MIN_DELAY_BETWEEN_EMAILS_MS;
     const batchId = randomUUID();
     const createdJobs = [];
 
-    for (let i = 0; i < cleanRecipients.length; i++) {
-      const recipient = cleanRecipients[i];
-      // Stagger each recipient in the batch by delayStep
-      const targetTime = new Date(baseScheduledTime.getTime() + i * delayStep);
+    // Assign senders round-robin and stagger scheduledAt
+    for (let i = 0; i < emails.length; i++) {
+      const toEmail = emails[i];
+      const assignedSender = senders[i % senders.length]; // Round-robin sender assignment
+      const staggeredScheduledAt = new Date(baseScheduledTime.getTime() + i * delayStep);
 
-      // Create in Postgres
+      // 1. Insert EmailJob row (status = scheduled)
       const emailJob = await prisma.emailJob.create({
         data: {
           userId: req.user?.id || null,
-          senderId: sender.id,
-          toEmail: recipient,
+          senderId: assignedSender.id,
+          toEmail,
           subject,
           body,
-          scheduledAt: targetTime,
+          scheduledAt: staggeredScheduledAt,
           status: 'scheduled',
           batchId,
         },
         include: { sender: true },
       });
 
-      // Index into Elasticsearch
+      // 2. Add BullMQ delayed job with jobId = EmailJob.id (Guarantees strict idempotency)
+      await scheduleEmailInQueue(
+        {
+          emailJobId: emailJob.id,
+          senderId: assignedSender.id,
+          userId: emailJob.userId,
+          toEmail,
+          subject,
+          body,
+          delayBetweenEmailsMs: delayStep,
+          hourlyLimit: hourlyLimit || env.MAX_EMAILS_PER_HOUR_PER_SENDER,
+        },
+        staggeredScheduledAt
+      );
+
+      // 3. Index to Elasticsearch
       await indexEmailJob({
         id: emailJob.id,
         userId: emailJob.userId,
         senderId: emailJob.senderId,
-        senderEmail: sender.email,
+        senderEmail: assignedSender.email,
         toEmail: emailJob.toEmail,
         subject: emailJob.subject,
         body: emailJob.body,
@@ -89,22 +117,13 @@ export async function scheduleEmails(req: AuthenticatedRequest, res: Response): 
         scheduledAt: emailJob.scheduledAt,
       });
 
-      // Enqueue to BullMQ delayed queue
-      await scheduleEmailInQueue(
-        {
-          emailJobId: emailJob.id,
-          senderId: sender.id,
-          userId: emailJob.userId,
-          toEmail: recipient,
-          subject,
-          body,
-          delayBetweenEmailsMs: delayStep,
-          hourlyLimit: hourlyLimit ? Number(hourlyLimit) : env.MAX_EMAILS_PER_HOUR_PER_SENDER,
-        },
-        targetTime
-      );
-
-      createdJobs.push(emailJob);
+      createdJobs.push({
+        id: emailJob.id,
+        toEmail: emailJob.toEmail,
+        senderEmail: assignedSender.email,
+        scheduledAt: emailJob.scheduledAt,
+        status: emailJob.status,
+      });
     }
 
     res.status(201).json({
@@ -119,28 +138,14 @@ export async function scheduleEmails(req: AuthenticatedRequest, res: Response): 
   }
 }
 
+// 2. GET /api/emails/scheduled (Paginated)
 export async function getScheduledEmails(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
+    const page = Math.max(1, parseInt((req.query.page as string) || '1', 10));
+    const limit = Math.max(1, Math.min(100, parseInt((req.query.limit as string) || '20', 10)));
+    const skip = (page - 1) * limit;
     const search = req.query.search as string;
 
-    if (search && search.trim()) {
-      // Search via Elasticsearch
-      const esResults = await searchEmailsInES({
-        query: search,
-        status: 'scheduled',
-      });
-
-      if (esResults) {
-        res.json({
-          total: esResults.total,
-          emails: esResults.hits,
-          source: 'elasticsearch',
-        });
-        return;
-      }
-    }
-
-    // Database lookup
     const whereClause: any = {
       status: { in: ['scheduled', 'processing'] },
     };
@@ -159,35 +164,31 @@ export async function getScheduledEmails(req: AuthenticatedRequest, res: Respons
         where: whereClause,
         include: { sender: { select: { id: true, name: true, email: true } } },
         orderBy: { scheduledAt: 'asc' },
+        skip,
+        take: limit,
       }),
     ]);
 
-    res.json({ total, emails, source: 'postgres' });
+    res.json({
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
+      emails,
+    });
   } catch (error) {
     console.error('Error fetching scheduled emails:', error);
     res.status(500).json({ error: 'Failed to fetch scheduled emails' });
   }
 }
 
+// 2. GET /api/emails/sent (Paginated)
 export async function getSentEmails(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
+    const page = Math.max(1, parseInt((req.query.page as string) || '1', 10));
+    const limit = Math.max(1, Math.min(100, parseInt((req.query.limit as string) || '20', 10)));
+    const skip = (page - 1) * limit;
     const search = req.query.search as string;
-
-    if (search && search.trim()) {
-      const esResults = await searchEmailsInES({
-        query: search,
-        status: 'sent',
-      });
-
-      if (esResults) {
-        res.json({
-          total: esResults.total,
-          emails: esResults.hits,
-          source: 'elasticsearch',
-        });
-        return;
-      }
-    }
 
     const whereClause: any = {
       status: { in: ['sent', 'failed'] },
@@ -207,10 +208,18 @@ export async function getSentEmails(req: AuthenticatedRequest, res: Response): P
         where: whereClause,
         include: { sender: { select: { id: true, name: true, email: true } } },
         orderBy: { sentAt: 'desc' },
+        skip,
+        take: limit,
       }),
     ]);
 
-    res.json({ total, emails, source: 'postgres' });
+    res.json({
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
+      emails,
+    });
   } catch (error) {
     console.error('Error fetching sent emails:', error);
     res.status(500).json({ error: 'Failed to fetch sent emails' });
@@ -243,6 +252,7 @@ export async function getSenders(req: AuthenticatedRequest, res: Response): Prom
         host: true,
         port: true,
       },
+      orderBy: { createdAt: 'asc' },
     });
 
     res.json({ senders });
