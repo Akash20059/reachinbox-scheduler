@@ -26,7 +26,19 @@ const app = express();
 // Middleware
 app.use(
   cors({
-    origin: [env.FRONTEND_URL, 'http://localhost:5173', 'http://127.0.0.1:5173'],
+    origin: (requestOrigin, callback) => {
+      // allow requests with no origin (like mobile apps, curl, postman)
+      if (!requestOrigin) return callback(null, true);
+      if (
+        requestOrigin.includes('localhost') ||
+        requestOrigin.includes('127.0.0.1') ||
+        requestOrigin.endsWith('.vercel.app') ||
+        (env.FRONTEND_URL && requestOrigin === env.FRONTEND_URL)
+      ) {
+        return callback(null, true);
+      }
+      return callback(null, true);
+    },
     credentials: true,
   })
 );

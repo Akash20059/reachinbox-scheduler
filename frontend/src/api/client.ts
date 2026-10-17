@@ -20,6 +20,14 @@ export const apiClient = axios.create({
   },
 });
 
+apiClient.interceptors.request.use((config) => {
+  const token = localStorage.getItem('token');
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
+
 export const authApi = {
   getMe: async (): Promise<{ user: User; slackConnected: boolean; slackChannel: string | null }> => {
     const res = await apiClient.get('/auth/me');
@@ -27,9 +35,13 @@ export const authApi = {
   },
   loginWithEmail: async (email: string): Promise<{ user: User; token: string }> => {
     const res = await apiClient.post('/auth/login', { email });
+    if (res.data?.token) {
+      localStorage.setItem('token', res.data.token);
+    }
     return res.data;
   },
   logout: async (): Promise<void> => {
+    localStorage.removeItem('token');
     await apiClient.post('/auth/logout');
   },
   getGoogleAuthUrl: (): string => {
