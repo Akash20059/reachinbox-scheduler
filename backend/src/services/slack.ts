@@ -2,6 +2,7 @@ import axios from 'axios';
 import { prisma } from '../db/prisma.js';
 import { env } from '../config/env.js';
 import { redisConnection } from '../queues/email.queue.js';
+import { logger } from '../utils/logger.js';
 
 export function getSlackOAuthUrl(userId: string): string {
   const scope = encodeURIComponent('incoming-webhook,chat:write');
@@ -10,56 +11,62 @@ export function getSlackOAuthUrl(userId: string): string {
 }
 
 export async function exchangeSlackCode(code: string, userId: string) {
-  const response = await axios.post(
-    'https://slack.com/api/oauth.v2.access',
-    null,
-    {
-      params: {
-        client_id: env.SLACK_CLIENT_ID,
-        client_secret: env.SLACK_CLIENT_SECRET,
-        code,
-        redirect_uri: env.SLACK_REDIRECT_URI,
-      },
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
+  try {
+    const response = await axios.post(
+      'https://slack.com/api/oauth.v2.access',
+      null,
+      {
+        params: {
+          client_id: env.SLACK_CLIENT_ID,
+          client_secret: env.SLACK_CLIENT_SECRET,
+          code,
+          redirect_uri: env.SLACK_REDIRECT_URI,
+        },
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+      }
+    );
+
+    const data = response.data;
+    if (!data.ok) {
+      throw new Error(`Slack OAuth exchange failed: ${data.error}`);
     }
-  );
 
-  const data = response.data;
-  if (!data.ok) {
-    throw new Error(`Slack OAuth exchange failed: ${data.error}`);
+    const webhookUrl = data.incoming_webhook?.url || null;
+    const channel = data.incoming_webhook?.channel || null;
+    const teamName = data.team?.name || null;
+    const accessToken = data.access_token || null;
+
+    const connection = await prisma.slackConnection.upsert({
+      where: { userId },
+      update: {
+        webhookUrl,
+        channel,
+        teamName,
+        accessToken,
+      },
+      create: {
+        userId,
+        webhookUrl,
+        channel,
+        teamName,
+        accessToken,
+      },
+    });
+
+    logger.info({ userId, teamName, channel }, 'Slack OAuth connected successfully');
+    return connection;
+  } catch (error) {
+    logger.warn({ err: (error as Error).message }, 'Slack OAuth exchange error');
+    throw error;
   }
-
-  const webhookUrl = data.incoming_webhook?.url || null;
-  const channel = data.incoming_webhook?.channel || null;
-  const teamName = data.team?.name || null;
-  const accessToken = data.access_token || null;
-
-  const connection = await prisma.slackConnection.upsert({
-    where: { userId },
-    update: {
-      webhookUrl,
-      channel,
-      teamName,
-      accessToken,
-    },
-    create: {
-      userId,
-      webhookUrl,
-      channel,
-      teamName,
-      accessToken,
-    },
-  });
-
-  return connection;
 }
 
 /**
  * Sends a real Slack notification on hourly limit hit.
  * Uses Redis SET NX to ensure it fires only once per sender per hour window.
- * Silently skips with zero crash if user has not connected Slack.
+ * Silently catches and logs failures (revoked, expired, or invalid webhook) without crashing.
  */
 export async function sendRateLimitSlackAlert(
   userId: string | null | undefined,
@@ -67,38 +74,35 @@ export async function sendRateLimitSlackAlert(
   hourlyLimit: number,
   rescheduledTo: Date,
   hourKey: string
-) {
-  // 1. Deduplication Guard: Once per sender per hour window
-  const alertDedupeKey = `alert_sent:${senderEmail}:${hourKey}`;
-  const acquired = await redisConnection.set(alertDedupeKey, '1', 'EX', 7200, 'NX');
-
-  if (!acquired) {
-    // Alert already dispatched for this sender in this hour window
-    return;
-  }
-
-  // 2. Fetch connection from DB dynamically (handles reconnecting without redeploy)
-  let webhookUrl: string | null = null;
-
-  if (userId) {
-    const userConnection = await prisma.slackConnection.findUnique({
-      where: { userId },
-    });
-    webhookUrl = userConnection?.webhookUrl || null;
-  }
-
-  if (!webhookUrl) {
-    // Fallback: check if any user connected Slack (useful in dev/demo)
-    const anyConnection = await prisma.slackConnection.findFirst();
-    webhookUrl = anyConnection?.webhookUrl || null;
-  }
-
-  if (!webhookUrl) {
-    // Silently skip if user has not connected Slack
-    return;
-  }
-
+): Promise<void> {
   try {
+    // 1. Deduplication Guard: Once per sender per hour window
+    const alertDedupeKey = `alert_sent:${senderEmail}:${hourKey}`;
+    const acquired = await redisConnection.set(alertDedupeKey, '1', 'EX', 7200, 'NX');
+
+    if (!acquired) {
+      return;
+    }
+
+    // 2. Fetch connection from DB dynamically
+    let webhookUrl: string | null = null;
+
+    if (userId) {
+      const userConnection = await prisma.slackConnection.findUnique({
+        where: { userId },
+      });
+      webhookUrl = userConnection?.webhookUrl || null;
+    }
+
+    if (!webhookUrl) {
+      const anyConnection = await prisma.slackConnection.findFirst();
+      webhookUrl = anyConnection?.webhookUrl || null;
+    }
+
+    if (!webhookUrl) {
+      return;
+    }
+
     const formattedTime = rescheduledTo.toLocaleTimeString('en-US', {
       hour: '2-digit',
       minute: '2-digit',
@@ -139,8 +143,8 @@ export async function sendRateLimitSlackAlert(
       headers: { 'Content-Type': 'application/json' },
     });
 
-    console.log(`\n🔔 [SLACK NOTIFICATION SENT] To channel for sender ${senderEmail} (Status: ${res.status})\n`);
+    logger.info({ senderEmail, status: res.status }, 'Slack rate limit alert dispatched successfully');
   } catch (error) {
-    console.error('❌ Failed to dispatch Slack rate limit alert:', (error as Error).message);
+    logger.warn({ err: (error as Error).message, senderEmail }, 'Failed to dispatch Slack alert (invalid/revoked webhook caught safely)');
   }
 }

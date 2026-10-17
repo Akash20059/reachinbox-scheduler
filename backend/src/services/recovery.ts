@@ -1,16 +1,19 @@
 import { prisma } from '../db/prisma.js';
 import { emailQueue, scheduleEmailInQueue } from '../queues/email.queue.js';
 import { env } from '../config/env.js';
+import { logger } from '../utils/logger.js';
+import { reindexMissingEmailsFromDB } from './elasticsearch.js';
 
 /**
- * Reconciles DB vs Queue on server boot:
+ * Reconciles DB vs Queue vs Elasticsearch on server boot:
  * 1. Resets stale 'processing' rows back to 'scheduled'.
- * 2. Re-enqueues any status='scheduled' rows missing from Redis BullMQ queue.
- * Guarantees zero lost jobs and strict idempotency across server restarts.
+ * 2. Re-enqueues any status='scheduled' rows missing from Redis BullMQ queue (including overdue ones with delay=0).
+ * 3. Never creates duplicate jobs for rows already in the queue.
+ * 4. Reindexes any missing EmailJob rows into Elasticsearch.
  */
-export async function recoverScheduledJobsOnStartup() {
+export async function recoverScheduledJobsOnStartup(): Promise<void> {
   try {
-    console.log('🔄 [Startup Reconciliation] Checking for pending jobs...');
+    logger.info('Starting server boot reconciliation...');
 
     // 1. Reset any stale 'processing' jobs back to 'scheduled'
     const resetResult = await prisma.emailJob.updateMany({
@@ -19,7 +22,7 @@ export async function recoverScheduledJobsOnStartup() {
     });
 
     if (resetResult.count > 0) {
-      console.log(`⚠️ Reset ${resetResult.count} stale 'processing' jobs back to 'scheduled'.`);
+      logger.warn({ count: resetResult.count }, 'Reset stale processing jobs back to scheduled');
     }
 
     // 2. Fetch all 'scheduled' jobs
@@ -28,19 +31,16 @@ export async function recoverScheduledJobsOnStartup() {
       include: { sender: true },
     });
 
-    console.log(`📋 Found ${scheduledJobs.length} scheduled jobs in database to verify.`);
+    logger.info({ totalScheduledInDB: scheduledJobs.length }, 'Verifying scheduled jobs in BullMQ queue...');
 
     let reEnqueuedCount = 0;
 
     for (const job of scheduledJobs) {
-      // Check if job exists in BullMQ (Redis)
+      // (c) Never create a duplicate job if it is already in BullMQ
       const existingJob = await emailQueue.getJob(job.id);
 
       if (!existingJob) {
-        console.log(
-          `⚡ Re-enqueuing missing job ${job.id} (To: ${job.toEmail}, Scheduled for: ${job.scheduledAt.toISOString()})`
-        );
-
+        // (b) Re-enqueue missing rows, including overdue ones (scheduledAt in past => delay=0)
         await scheduleEmailInQueue(
           {
             emailJobId: job.id,
@@ -49,8 +49,9 @@ export async function recoverScheduledJobsOnStartup() {
             toEmail: job.toEmail,
             subject: job.subject,
             body: job.body,
-            delayBetweenEmailsMs: env.MIN_DELAY_BETWEEN_EMAILS_MS,
-            hourlyLimit: env.MAX_EMAILS_PER_HOUR_PER_SENDER,
+            delayBetweenEmailsMs: job.delayBetweenMs ?? env.MIN_DELAY_BETWEEN_EMAILS_MS,
+            hourlyLimit: job.hourlyLimit || env.MAX_EMAILS_PER_HOUR_PER_SENDER,
+            batchId: job.batchId,
           },
           job.scheduledAt
         );
@@ -59,10 +60,17 @@ export async function recoverScheduledJobsOnStartup() {
       }
     }
 
-    console.log(
-      `✅ [Startup Reconciliation] Complete. Verified ${scheduledJobs.length} jobs, re-enqueued ${reEnqueuedCount} missing from Redis.`
+    logger.info(
+      {
+        verified: scheduledJobs.length,
+        reEnqueued: reEnqueuedCount,
+      },
+      'Queue reconciliation completed'
     );
+
+    // 4. Reindex missing jobs in Elasticsearch
+    await reindexMissingEmailsFromDB();
   } catch (error) {
-    console.error('❌ Error during startup job recovery:', (error as Error).message);
+    logger.error({ err: (error as Error).message }, 'Error during startup job recovery');
   }
 }

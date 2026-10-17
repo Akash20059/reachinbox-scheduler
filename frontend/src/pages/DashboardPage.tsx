@@ -9,6 +9,8 @@ import {
   Star,
   ExternalLink,
   ChevronDown,
+  CheckCircle2,
+  AlertCircle,
 } from 'lucide-react';
 import { useAuth } from '../hooks/useAuth';
 import { useToast } from '../components/ui/Toast';
@@ -86,9 +88,10 @@ export const DashboardPage: React.FC = () => {
           setEmails(sentRes.emails);
           setTotalPages(sentRes.totalPages || 1);
         }
-      } catch (err: any) {
+      } catch (err: unknown) {
         if (!isBackground) {
-          error('Failed to load email jobs');
+          const msg = err instanceof Error ? err.message : 'Failed to load email jobs';
+          error(msg);
         }
       } finally {
         if (!isBackground) setLoading(false);
@@ -128,7 +131,7 @@ export const DashboardPage: React.FC = () => {
     return `${day} ${time}`;
   };
 
-  // Table Columns
+  // Table Columns (shared between Scheduled and Sent views - zero duplicate table code)
   const columns: Column<EmailJob>[] = [
     {
       header: 'Recipient',
@@ -150,12 +153,14 @@ export const DashboardPage: React.FC = () => {
               <span>{formatScheduledTime(job.scheduledAt)}</span>
             </span>
           ) : job.status === 'sent' ? (
-            <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-slate-100 text-slate-600 border border-slate-200 flex-shrink-0">
-              Sent
+            <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200 flex-shrink-0">
+              <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+              <span>Sent</span>
             </span>
           ) : (
-            <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-rose-50 text-rose-700 border border-rose-200 flex-shrink-0">
-              Failed
+            <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-rose-50 text-rose-700 border border-rose-200 flex-shrink-0">
+              <AlertCircle className="w-3.5 h-3.5 text-rose-600" />
+              <span>Failed</span>
             </span>
           )}
 

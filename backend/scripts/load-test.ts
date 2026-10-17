@@ -39,17 +39,33 @@ async function runLoadTest() {
     console.log(`👉 To connect Slack, visit: ${BACKEND_URL}/slack/connect\n`);
   }
 
-  console.log(`🚀 Dispatching POST ${BACKEND_URL}/api/schedule for ${count} emails...`);
+  console.log(`🔐 Authenticating load test client via ${BACKEND_URL}/auth/login...`);
+  const loginRes = await axios.post(`${BACKEND_URL}/auth/login`, {
+    email: 'oliver.brown@domain.io',
+  });
+  const token = loginRes.data.token;
+  console.log(`✅ Authenticated as Oliver Brown (User ID: ${loginRes.data.user.id})\n`);
+
+  console.log(`🚀 Dispatching POST ${BACKEND_URL}/api/schedule for ${count} emails with Idempotency-Key...`);
 
   const startTime = Date.now();
-  const scheduleRes = await axios.post(`${BACKEND_URL}/api/schedule`, {
-    subject: 'ReachInbox High Load Rate Limit Test',
-    body: '<h3>Load Test Email</h3><p>Verifying throughput under load and graceful hourly rate limit delay.</p>',
-    emails,
-    startTime: now.toISOString(),
-    delayBetweenMs: 0,
-    hourlyLimit,
-  });
+  const scheduleRes = await axios.post(
+    `${BACKEND_URL}/api/schedule`,
+    {
+      subject: 'ReachInbox High Load Rate Limit Test',
+      body: '<h3>Load Test Email</h3><p>Verifying throughput under load and graceful hourly rate limit delay.</p>',
+      emails,
+      startTime: now.toISOString(),
+      delayBetweenMs: 0,
+      hourlyLimit,
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Idempotency-Key': `load-test-${Date.now()}`,
+      },
+    }
+  );
 
   const duration = Date.now() - startTime;
   const batchId = scheduleRes.data.batchId;

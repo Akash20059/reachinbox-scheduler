@@ -3,6 +3,8 @@ import { Strategy as GoogleStrategy } from 'passport-google-oauth20';
 import { prisma } from '../db/prisma.js';
 import { env } from './env.js';
 
+import { logger } from '../utils/logger.js';
+
 if (env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET) {
   passport.use(
     new GoogleStrategy(
@@ -45,7 +47,7 @@ if (env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET) {
     )
   );
 } else {
-  console.warn('⚠️ Google OAuth credentials missing in .env');
+  logger.warn('Google OAuth credentials missing in .env');
 }
 
 export default passport;

@@ -3,6 +3,7 @@ import { exchangeSlackCode, getSlackOAuthUrl } from '../services/slack.js';
 import { env } from '../config/env.js';
 import { AuthenticatedRequest } from '../middleware/auth.js';
 import { prisma } from '../db/prisma.js';
+import { logger } from '../utils/logger.js';
 
 // GET /slack/connect -> redirects to Slack OAuth authorization page
 export async function connectSlack(req: AuthenticatedRequest, res: Response): Promise<void> {
@@ -24,7 +25,7 @@ export async function handleSlackOAuthCallback(req: Request, res: Response): Pro
     const { code, state, error } = req.query;
 
     if (error) {
-      console.error('Slack OAuth returned error:', error);
+      logger.error({ error }, 'Slack OAuth returned error query param');
       res.redirect(`${env.FRONTEND_URL}?slack_error=${encodeURIComponent(String(error))}`);
       return;
     }
@@ -38,10 +39,10 @@ export async function handleSlackOAuthCallback(req: Request, res: Response): Pro
 
     await exchangeSlackCode(String(code), userId);
 
-    console.log(`✅ Slack connected successfully for user ${userId}`);
+    logger.info({ userId }, 'Slack connected successfully in OAuth callback');
     res.redirect(`${env.FRONTEND_URL}?slack_connected=true`);
   } catch (err) {
-    console.error('Error in Slack OAuth callback:', err);
+    logger.error({ err: (err as Error).message }, 'Error in Slack OAuth callback');
     res.redirect(`${env.FRONTEND_URL}?slack_error=oauth_failed`);
   }
 }
@@ -51,9 +52,7 @@ export async function disconnectSlack(req: AuthenticatedRequest, res: Response):
   try {
     const userId = req.user?.id;
     if (!userId) {
-      // Disconnect any active connection if in dev
-      await prisma.slackConnection.deleteMany();
-      res.json({ success: true, message: 'All Slack connections disconnected' });
+      res.status(401).json({ error: 'Unauthorized: Authentication required' });
       return;
     }
 
@@ -61,8 +60,10 @@ export async function disconnectSlack(req: AuthenticatedRequest, res: Response):
       where: { userId },
     });
 
+    logger.info({ userId }, 'Slack connection disconnected');
     res.json({ success: true, message: 'Slack disconnected successfully' });
   } catch (err) {
+    logger.error({ err: (err as Error).message }, 'Failed to disconnect Slack');
     res.status(500).json({ error: 'Failed to disconnect Slack' });
   }
 }
@@ -71,17 +72,14 @@ export async function disconnectSlack(req: AuthenticatedRequest, res: Response):
 export async function getSlackStatus(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
     const userId = req.user?.id;
-    let connection = null;
-
-    if (userId) {
-      connection = await prisma.slackConnection.findUnique({
-        where: { userId },
-      });
+    if (!userId) {
+      res.status(401).json({ error: 'Unauthorized: Authentication required' });
+      return;
     }
 
-    if (!connection) {
-      connection = await prisma.slackConnection.findFirst();
-    }
+    const connection = await prisma.slackConnection.findUnique({
+      where: { userId },
+    });
 
     res.json({
       connected: !!connection?.webhookUrl,
@@ -90,6 +88,7 @@ export async function getSlackStatus(req: AuthenticatedRequest, res: Response): 
       connectedAt: connection?.updatedAt || null,
     });
   } catch (err) {
+    logger.error({ err: (err as Error).message }, 'Failed to retrieve Slack status');
     res.status(500).json({ error: 'Failed to retrieve Slack status' });
   }
 }

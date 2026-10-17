@@ -23,9 +23,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
   const [slackConnected, setSlackConnected] = useState<boolean>(false);
   const [slackChannel, setSlackChannel] = useState<string | null>(null);
 
-  const fetchCurrentUser = async () => {
+  const fetchCurrentUser = async (isInitial = false) => {
     try {
-      setLoading(true);
+      if (isInitial) setLoading(true);
       const data = await authApi.getMe();
       setUser(data.user);
       setSlackConnected(data.slackConnected);
@@ -35,18 +35,18 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
       setSlackConnected(false);
       setSlackChannel(null);
     } finally {
-      setLoading(false);
+      if (isInitial) setLoading(false);
     }
   };
 
   useEffect(() => {
-    fetchCurrentUser();
+    fetchCurrentUser(true);
   }, []);
 
   const loginWithEmail = async (email: string) => {
     const data = await authApi.loginWithEmail(email);
     setUser(data.user);
-    await fetchCurrentUser();
+    await fetchCurrentUser(false);
   };
 
   const loginWithGoogle = () => {

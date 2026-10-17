@@ -1,8 +1,9 @@
 import { redisConnection } from '../queues/email.queue.js';
 import { env } from '../config/env.js';
+import { logger } from '../utils/logger.js';
 
-// Lua script for atomic hourly rate limiting
-// Returns 1 if allowed (incremented), 0 if limit exceeded
+// Atomic Lua script: Checks counter against hourlyLimit and increments in one atomic step
+// Returns 1 if allowed & incremented, 0 if limit exceeded
 const RATE_LIMIT_LUA = `
 local current = redis.call('GET', KEYS[1])
 if current and tonumber(current) >= tonumber(ARGV[1]) then
@@ -16,6 +17,16 @@ else
 end
 `;
 
+// Atomic Lua script to decrement counter without dropping below zero
+const DECREMENT_LUA = `
+local current = redis.call('GET', KEYS[1])
+if current and tonumber(current) > 0 then
+    return redis.call('DECR', KEYS[1])
+else
+    return 0
+end
+`;
+
 export function getHourWindowKey(senderId: string, date: Date = new Date()): string {
   const yyyy = date.getUTCFullYear();
   const mm = String(date.getUTCMonth() + 1).padStart(2, '0');
@@ -24,10 +35,15 @@ export function getHourWindowKey(senderId: string, date: Date = new Date()): str
   return `rl:${senderId}:${yyyy}${mm}${dd}${hh}`;
 }
 
+export interface RateLimitCheckResult {
+  allowed: boolean;
+  hourKey: string;
+}
+
 export async function checkAndIncrementRateLimit(
   senderId: string,
   hourlyLimit: number = env.MAX_EMAILS_PER_HOUR_PER_SENDER
-): Promise<{ allowed: boolean; hourKey: string }> {
+): Promise<RateLimitCheckResult> {
   const hourKey = getHourWindowKey(senderId);
   const expireSeconds = 7200; // 2 hours TTL
 
@@ -47,8 +63,8 @@ export async function checkAndIncrementRateLimit(
 
 export async function decrementRateLimit(hourKey: string): Promise<void> {
   try {
-    await redisConnection.decr(hourKey);
+    await redisConnection.eval(DECREMENT_LUA, 1, hourKey);
   } catch (error) {
-    console.error(`Failed to decrement rate limit counter on ${hourKey}:`, error);
+    logger.error({ err: (error as Error).message, hourKey }, 'Failed to decrement rate limit counter');
   }
 }

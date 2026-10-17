@@ -1,4 +1,4 @@
-import express, { Request, Response } from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import { createBullBoard } from '@bull-board/api';
 import { BullMQAdapter } from '@bull-board/api/bullMQAdapter';
@@ -14,6 +14,8 @@ import { createEmailWorker } from './workers/email.worker.js';
 import { initElasticsearch, esClient } from './services/elasticsearch.js';
 import { seedSenders } from './db/seed.js';
 import { recoverScheduledJobsOnStartup } from './services/recovery.js';
+import { logger } from './utils/logger.js';
+import { errorHandler } from './middleware/error.js';
 
 import authRoutes from './routes/auth.routes.js';
 import emailRoutes from './routes/email.routes.js';
@@ -33,7 +35,26 @@ app.use(passport.initialize());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// BullMQ Live Dashboard setup
+// BullMQ Live Dashboard Basic Auth Protection (Requirement 8)
+function bullBoardBasicAuth(req: Request, res: Response, next: NextFunction): void {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Basic ')) {
+    res.setHeader('WWW-Authenticate', 'Basic realm="Bull Board"');
+    res.status(401).send('Authentication required');
+    return;
+  }
+
+  const credentials = Buffer.from(authHeader.split(' ')[1], 'base64').toString('ascii');
+  const [username, password] = credentials.split(':');
+
+  if (username === env.BULL_BOARD_USER && password === env.BULL_BOARD_PASS) {
+    return next();
+  }
+
+  res.setHeader('WWW-Authenticate', 'Basic realm="Bull Board"');
+  res.status(401).send('Invalid credentials');
+}
+
 const serverAdapter = new ExpressAdapter();
 serverAdapter.setBasePath('/admin/queues');
 
@@ -42,9 +63,9 @@ createBullBoard({
   serverAdapter,
 });
 
-app.use('/admin/queues', serverAdapter.getRouter());
+app.use('/admin/queues', bullBoardBasicAuth, serverAdapter.getRouter());
 
-// Routes (supporting both /api/... and top-level endpoints)
+// Routes
 app.use('/api', emailRoutes);
 app.use('/api/auth', authRoutes);
 app.use('/api/slack', slackRoutes);
@@ -54,7 +75,7 @@ app.use('/emails', emailRoutes);
 app.use('/slack', slackRoutes);
 
 // Health Check route
-app.get('/health', async (req: Request, res: Response) => {
+app.get('/health', async (_req: Request, res: Response) => {
   let dbStatus = 'disconnected';
   let redisStatus = 'disconnected';
   let esStatus = 'disconnected';
@@ -95,22 +116,23 @@ app.get('/health', async (req: Request, res: Response) => {
   });
 });
 
+// Central error-handling middleware (Requirement 10)
+app.use(errorHandler);
+
 // Start Server
-async function startServer() {
+export async function startServer() {
   try {
-    console.log('🚀 Initializing ReachInbox Email Scheduler...');
+    logger.info('Initializing ReachInbox Email Scheduler...');
 
     // 1. Initialize BullMQ Worker
     createEmailWorker();
-    console.log(`✅ BullMQ Worker started with concurrency: ${env.WORKER_CONCURRENCY}`);
+    logger.info({ concurrency: env.WORKER_CONCURRENCY }, 'BullMQ Worker started');
 
     // 2. Start HTTP server
     app.listen(env.PORT, async () => {
-      console.log(`🌐 Server listening at http://localhost:${env.PORT}`);
-      console.log(`📊 BullMQ Dashboard: http://localhost:${env.PORT}/admin/queues`);
-      console.log(`🩺 Health check: http://localhost:${env.PORT}/health`);
+      logger.info({ port: env.PORT, dashboard: `http://localhost:${env.PORT}/admin/queues` }, 'Server listening');
 
-      // 3. Connect to Elasticsearch & create index
+      // 3. Connect to Elasticsearch & verify index
       await initElasticsearch();
 
       // 4. Seed Ethereal SMTP accounts into DB
@@ -120,11 +142,13 @@ async function startServer() {
       await recoverScheduledJobsOnStartup();
     });
   } catch (error) {
-    console.error('❌ Failed to start server:', error);
+    logger.error({ error }, 'Failed to start server');
     process.exit(1);
   }
 }
 
-startServer();
+if (process.env.NODE_ENV !== 'test') {
+  startServer();
+}
 
 export default app;

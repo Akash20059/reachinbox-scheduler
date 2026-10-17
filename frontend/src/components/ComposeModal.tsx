@@ -105,13 +105,13 @@ export const ComposeModal: React.FC<ComposeModalProps> = ({
     Papa.parse(file, {
       complete: (results) => {
         const extracted: string[] = [];
-        results.data.forEach((row: any) => {
+        results.data.forEach((row: unknown) => {
           if (Array.isArray(row)) {
             row.forEach((cell) => {
               if (typeof cell === 'string') extracted.push(cell);
             });
           } else if (typeof row === 'object' && row !== null) {
-            Object.values(row).forEach((val) => {
+            Object.values(row as Record<string, unknown>).forEach((val) => {
               if (typeof val === 'string') extracted.push(val);
             });
           }
@@ -179,8 +179,14 @@ export const ComposeModal: React.FC<ComposeModalProps> = ({
       success(`Successfully scheduled ${finalEmails.length} email(s)!`);
       onSuccess();
       onClose();
-    } catch (err: any) {
-      const msg = err.response?.data?.error || err.message || 'Failed to schedule emails';
+    } catch (err: unknown) {
+      let msg = 'Failed to schedule emails';
+      if (typeof err === 'object' && err !== null && 'response' in err) {
+        const responseData = (err as { response?: { data?: { error?: string } } }).response?.data;
+        if (responseData?.error) msg = responseData.error;
+      } else if (err instanceof Error) {
+        msg = err.message;
+      }
       error(msg);
     } finally {
       setLoading(false);

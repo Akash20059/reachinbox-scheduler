@@ -8,21 +8,25 @@ A production-grade, distributed email job scheduler built with **TypeScript**, *
 
 - **Zero Cron Jobs:** All delays, scheduling, and staggering are managed exclusively by BullMQ delayed queues with millisecond precision.
 - **Strict Idempotency & Zero Drops:** Every email job uses `jobId = EmailJob.id`. Atomic database state transitions (`scheduled` ➔ `processing` ➔ `sent` / `failed`) ensure no job is ever dispatched twice.
+- **Idempotency-Key HTTP Header:** `POST /api/schedule` supports an optional `Idempotency-Key: <unique-key>` header cached in Redis for 24 hours. Repeating requests with the same key returns the original batch payload with HTTP 200, preventing duplicate dispatches.
+- **Per-Batch Throttling & Limits:** Compose forms supply custom `delayBetweenMs` and `hourlyLimit` stored in a dedicated `Batch` record and on `EmailJob` rows, respected by workers and bounded by `MAX_HOURLY_LIMIT_ALLOWED` and `MAX_DELAY_ALLOWED_MS`.
 - **Crash Persistence & Recovery:** 
   - Redis runs with `--appendonly yes` to guarantee durability across restarts.
-  - On server boot, startup reconciliation automatically cleans up any stale `processing` jobs and re-enqueues any `scheduled` jobs missing from Redis.
+  - On server boot, startup reconciliation automatically cleans up stale `processing` jobs, re-enqueues missing/overdue `scheduled` jobs into BullMQ without duplicates, and synchronizes Elasticsearch index records.
 - **Multi-Worker Per-Sender Hourly Rate Limiting:**
   - Evaluated via an atomic Redis Lua script checking `rl:{senderId}:{YYYYMMDDHH}` with 2h TTL.
-  - When a sender reaches the hourly limit, the job is **not dropped or marked as failed**; instead, it is rescheduled into the next hour window with an offset using BullMQ's `job.moveToDelayed()` and `DelayedError`.
+  - If a sender reaches the limit, jobs are deferred to the next window preserving their original relative ordering (`job.moveToDelayed` with `DelayedError`).
+  - If delivery fails before send, the rate limiter counter is safely decremented.
 - **Real Slack OAuth & Rate-Limit Alerts:**
-  - Real Slack OAuth flow (`/slack/connect`, `/slack/callback`, `/slack/status`, `/slack/disconnect`).
-  - When a sender hits its hourly limit, a Slack alert is sent via the stored incoming webhook (deduplicated per sender per hour via Redis `SET NX`).
-- **Elasticsearch Full-Text Search:**
-  - Fast full-text search across `subject`, `body`, and recipient `toEmail`, debounced on the frontend with PostgreSQL database fallback.
+  - Full Slack OAuth flow (`/slack/connect`, `/slack/callback`, `/slack/status`, `/slack/disconnect`).
+  - Webhook failures are caught and logged without disrupting scheduling or workers.
+- **Elasticsearch Full-Text Search with Resilience:**
+  - High-performance search across `subject`, `body`, and recipient `toEmail`, strictly scoped by the authenticated `userId`.
+  - Resilience guarantees that even if Elasticsearch is unavailable, scheduling, workers, and fallback database queries continue uninterrupted.
 - **Client-Side CSV Parsing:**
   - Compose modal parses uploaded CSV/TXT files client-side using `papaparse`, validates RFC compliant email formats, removes duplicates, and renders an *“N email addresses detected”* badge.
 - **Bull-Board Live Queue Monitor:**
-  - Accessible directly at `/admin/queues` with real-time delayed, active, completed, and failed job visualizers.
+  - Protected by HTTP Basic Authentication (`BULL_BOARD_USER`, `BULL_BOARD_PASS`) at `/admin/queues`.
 
 ---
 

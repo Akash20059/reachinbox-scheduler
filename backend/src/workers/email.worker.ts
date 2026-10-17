@@ -6,14 +6,13 @@ import { sendEmailViaSender } from '../services/email.js';
 import { updateEmailJobInES } from '../services/elasticsearch.js';
 import { sendRateLimitSlackAlert } from '../services/slack.js';
 import { checkAndIncrementRateLimit, decrementRateLimit } from '../services/rate-limiter.js';
+import { logger } from '../utils/logger.js';
 
 export function createEmailWorker() {
   const worker = new Worker<EmailJobData>(
     EMAIL_QUEUE_NAME,
     async (job: Job<EmailJobData>, token?: string) => {
       const { emailJobId, senderId, toEmail, subject, body } = job.data;
-      const hourlyLimit = job.data.hourlyLimit || env.MAX_EMAILS_PER_HOUR_PER_SENDER;
-      const minDelay = job.data.delayBetweenEmailsMs ?? env.MIN_DELAY_BETWEEN_EMAILS_MS;
 
       // 1. Atomic status transition: scheduled -> processing
       // If 0 rows updated, another worker picked it up or it was already sent. Skip immediately.
@@ -31,18 +30,24 @@ export function createEmailWorker() {
         return { skipped: true };
       }
 
-      // Fetch the full record with sender credentials
+      // Fetch the full record with sender credentials and per-batch settings
       const emailRecord = await prisma.emailJob.findUnique({
         where: { id: emailJobId },
         include: { sender: true },
       });
 
       if (!emailRecord) {
-        console.warn(`⚠️ EmailJob ${emailJobId} record missing. Skipping.`);
+        logger.warn({ emailJobId }, 'EmailJob record missing in database, skipping');
         return { skipped: true };
       }
 
-      // 2. Atomic Rate Limit Check via Redis Lua Script
+      // 2. Use batch settings, falling back to env defaults
+      const hourlyLimit =
+        job.data.hourlyLimit || emailRecord.hourlyLimit || env.MAX_EMAILS_PER_HOUR_PER_SENDER;
+      const minDelay =
+        job.data.delayBetweenEmailsMs ?? emailRecord.delayBetweenMs ?? env.MIN_DELAY_BETWEEN_EMAILS_MS;
+
+      // 3. Atomic Rate Limit Check via Redis Lua Script
       const rateCheck = await checkAndIncrementRateLimit(senderId, hourlyLimit);
 
       if (!rateCheck.allowed) {
@@ -51,14 +56,21 @@ export function createEmailWorker() {
         const nextHour = new Date(now);
         nextHour.setUTCHours(nextHour.getUTCHours() + 1, 0, 0, 0);
 
-        // Small offset based on original scheduledAt to strictly preserve batch sequence
+        // Keep relative offset within the hour window (0 to 3,599,999 ms) to strictly preserve sequence
         const originalTimeMs = new Date(emailRecord.scheduledAt).getTime();
-        const offsetMs = Math.abs(originalTimeMs % 60000); // 0-59999ms offset
+        const offsetMs = Math.abs(originalTimeMs % 3600000);
         const rescheduledTimestamp = nextHour.getTime() + offsetMs;
         const rescheduledDate = new Date(rescheduledTimestamp);
 
-        console.warn(
-          `🚨 [Rate Limit Exceeded] Sender ${emailRecord.sender.email} hit limit of ${hourlyLimit}/hr in ${rateCheck.hourKey}. Delaying job ${emailJobId} to ${rescheduledDate.toISOString()}`
+        logger.warn(
+          {
+            senderEmail: emailRecord.sender.email,
+            hourlyLimit,
+            hourKey: rateCheck.hourKey,
+            emailJobId,
+            rescheduledDate: rescheduledDate.toISOString(),
+          },
+          'Rate limit exceeded for sender, deferring job to next hour window'
         );
 
         // Reset status to 'scheduled' and update scheduledAt in DB
@@ -76,7 +88,7 @@ export function createEmailWorker() {
           scheduledAt: rescheduledDate,
         });
 
-        // Send real Slack alert (deduplicated per sender per hour window via Redis SET NX)
+        // Send Slack alert (deduplicated per sender per hour window via Redis SET NX)
         await sendRateLimitSlackAlert(
           emailRecord.userId,
           emailRecord.sender.email,
@@ -85,12 +97,12 @@ export function createEmailWorker() {
           rateCheck.hourKey
         );
 
-        // Move job to delayed in BullMQ and throw DelayedError (graceful reschedule without failing)
+        // Move job to delayed in BullMQ and throw DelayedError
         await job.moveToDelayed(rescheduledTimestamp, token);
         throw new DelayedError();
       }
 
-      // 3. Minimum delay between individual email sends
+      // 4. Minimum delay between individual email sends for this sender
       const lastSendKey = `sender:last_send:${senderId}`;
       const lastSendTimeStr = await redisConnection.get(lastSendKey);
       if (lastSendTimeStr) {
@@ -102,7 +114,7 @@ export function createEmailWorker() {
         }
       }
 
-      // 4. Send email via Nodemailer with Ethereal SMTP
+      // 5. Send email via Nodemailer with Ethereal SMTP
       try {
         const sendResult = await sendEmailViaSender(emailRecord.sender, {
           to: toEmail,
@@ -128,14 +140,15 @@ export function createEmailWorker() {
         // Update Elasticsearch
         await updateEmailJobInES(emailJobId, { status: 'sent', sentAt: now });
 
-        // Print Ethereal preview URLs prominently in logs
-        console.log(`\n============================================================`);
-        console.log(`🚀 [EMAIL SENT] Job ID: ${emailJobId}`);
-        console.log(`   From: ${emailRecord.sender.name} <${emailRecord.sender.email}>`);
-        console.log(`   To: ${toEmail}`);
-        console.log(`   Subject: "${subject}"`);
-        console.log(`   🔗 Ethereal Preview URL: ${sendResult.previewUrl || 'Not available'}`);
-        console.log(`============================================================\n`);
+        logger.info(
+          {
+            emailJobId,
+            toEmail,
+            sender: emailRecord.sender.email,
+            previewUrl: sendResult.previewUrl,
+          },
+          'Email sent successfully'
+        );
 
         return {
           success: true,
@@ -143,11 +156,11 @@ export function createEmailWorker() {
           previewUrl: sendResult.previewUrl,
         };
       } catch (sendErr) {
-        // Decrement counter if send fails before delivery
+        // If a send fails before delivery, decrement the counter
         await decrementRateLimit(rateCheck.hourKey);
 
         const errorMsg = (sendErr as Error).message;
-        console.error(`❌ [Failed] Error sending email ${emailJobId}:`, errorMsg);
+        logger.error({ emailJobId, err: errorMsg }, 'Error sending email');
 
         await prisma.emailJob.update({
           where: { id: emailJobId },
@@ -171,7 +184,7 @@ export function createEmailWorker() {
 
   worker.on('failed', (job, err) => {
     if (err.name !== 'DelayedError') {
-      console.error(`❌ Job ${job?.id} failed with error:`, err.message);
+      logger.error({ jobId: job?.id, err: err.message }, 'BullMQ Job execution failed');
     }
   });
 

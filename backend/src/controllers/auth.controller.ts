@@ -4,6 +4,9 @@ import { prisma } from '../db/prisma.js';
 import { env } from '../config/env.js';
 import { AuthenticatedRequest } from '../middleware/auth.js';
 
+import { AuthUser } from '../middleware/auth.js';
+import { logger } from '../utils/logger.js';
+
 export function setTokenCookie(res: Response, token: string) {
   res.cookie('token', token, {
     httpOnly: true,
@@ -17,7 +20,7 @@ export function setTokenCookie(res: Response, token: string) {
 // Passport Google OAuth callback handler
 export async function handleGoogleOAuthSuccess(req: Request, res: Response): Promise<void> {
   try {
-    const user = req.user as any;
+    const user = req.user as AuthUser | undefined;
     if (!user) {
       res.redirect(`${env.FRONTEND_URL}/login?error=auth_failed`);
       return;
@@ -32,7 +35,7 @@ export async function handleGoogleOAuthSuccess(req: Request, res: Response): Pro
     setTokenCookie(res, token);
     res.redirect(`${env.FRONTEND_URL}/dashboard`);
   } catch (error) {
-    console.error('Error in Google OAuth callback handler:', error);
+    logger.error({ error }, 'Error in Google OAuth callback handler');
     res.redirect(`${env.FRONTEND_URL}/login?error=oauth_error`);
   }
 }

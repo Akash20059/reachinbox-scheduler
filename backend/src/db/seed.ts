@@ -1,5 +1,6 @@
 import { prisma } from './prisma.js';
 import { env } from '../config/env.js';
+import { logger } from '../utils/logger.js';
 
 export async function seedSenders() {
   try {
@@ -40,11 +41,23 @@ export async function seedSenders() {
             port: sender.port,
           },
         });
-        console.log(`✅ Seeded/Updated sender: ${sender.email} (${sender.name})`);
+        logger.info(`Seeded/Updated sender: ${sender.email} (${sender.name})`);
       }
     }
+
+    // Seed default demo user
+    await prisma.user.upsert({
+      where: { email: 'oliver.brown@domain.io' },
+      update: { name: 'Oliver Brown' },
+      create: {
+        email: 'oliver.brown@domain.io',
+        name: 'Oliver Brown',
+        avatar: 'https://images.unsplash.com/photo-1472099645785-5658abf4ff4e?w=80&auto=format&fit=crop&q=80',
+      },
+    });
+    logger.info('Seeded default user: oliver.brown@domain.io');
   } catch (error) {
-    console.error('❌ Failed to seed senders:', error);
+    logger.error({ error }, 'Failed to seed senders or default user');
   }
 }
 
@@ -52,7 +65,7 @@ if (process.argv[1]?.endsWith('seed.ts') || process.argv[1]?.endsWith('seed.js')
   seedSenders()
     .then(() => process.exit(0))
     .catch((err) => {
-      console.error(err);
+      logger.error({ err }, 'Seed script failed');
       process.exit(1);
     });
 }

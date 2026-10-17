@@ -23,6 +23,7 @@ model User {
   createdAt       DateTime         @default(now())
   updatedAt       DateTime         @updatedAt
   jobs            EmailJob[]
+  batches         Batch[]
   slackConnection SlackConnection?
 }
 
@@ -39,29 +40,50 @@ model Sender {
   jobs      EmailJob[]
 }
 
+model Batch {
+  id             String     @id @default(uuid())
+  userId         String?
+  subject        String
+  body           String
+  delayBetweenMs Int?
+  hourlyLimit    Int?
+  totalCount     Int        @default(0)
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+  jobs           EmailJob[]
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+}
+
 model EmailJob {
-  id          String    @id @default(uuid())
-  userId      String?
-  senderId    String
-  toEmail     String
-  subject     String
-  body        String
-  scheduledAt DateTime
-  sentAt      DateTime?
-  status      JobStatus @default(scheduled)
-  attempts    Int       @default(0)
-  error       String?
-  batchId     String?
-  createdAt   DateTime  @default(now())
-  updatedAt   DateTime  @updatedAt
+  id             String    @id @default(uuid())
+  userId         String?
+  senderId       String
+  toEmail        String
+  subject        String
+  body           String
+  delayBetweenMs Int?
+  hourlyLimit    Int?
+  scheduledAt    DateTime
+  sentAt         DateTime?
+  status         JobStatus @default(scheduled)
+  attempts       Int       @default(0)
+  error          String?
+  batchId        String?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
 
   user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
   sender Sender  @relation(fields: [senderId], references: [id], onDelete: Cascade)
+  batch  Batch?  @relation(fields: [batchId], references: [id], onDelete: SetNull)
 
   @@index([status])
   @@index([scheduledAt])
   @@index([senderId])
   @@index([userId])
+  @@index([batchId])
 }
 
 model SlackConnection {

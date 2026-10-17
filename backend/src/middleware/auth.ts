@@ -42,25 +42,14 @@ export async function authMiddleware(
         const decoded = jwt.verify(token, env.JWT_SECRET) as AuthUser;
         req.user = decoded;
         return next();
-      } catch (err) {
-        // Token invalid or expired
+      } catch {
+        res.status(401).json({ error: 'Unauthorized: Token expired or invalid' });
+        return;
       }
     }
 
-    // 3. Fallback for seamless local testing if user exists in database
-    const defaultUser = await prisma.user.findFirst();
-    if (defaultUser) {
-      req.user = {
-        id: defaultUser.id,
-        email: defaultUser.email,
-        name: defaultUser.name,
-        avatar: defaultUser.avatar,
-      };
-      return next();
-    }
-
-    res.status(401).json({ error: 'Unauthorized: Authentication required' });
-  } catch (error) {
+    res.status(401).json({ error: 'Unauthorized: Valid authentication cookie required' });
+  } catch {
     res.status(401).json({ error: 'Unauthorized: Authentication failed' });
   }
 }

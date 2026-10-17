@@ -31,7 +31,6 @@ export const SlackHeaderChip: React.FC<SlackHeaderChipProps> = ({
       setLoading(true);
       const res = await slackApi.getStatus();
       setStatus(res);
-      if (onStatusChange) onStatusChange(res);
     } catch {
       setStatus({ connected: false, channel: null, teamName: null });
     } finally {

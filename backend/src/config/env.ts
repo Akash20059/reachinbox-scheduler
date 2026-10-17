@@ -7,14 +7,20 @@ dotenv.config();
 dotenv.config({ path: path.resolve(__dirname, '../../../.env') });
 
 const envSchema = z.object({
-  PORT: z.string().default('4000').transform(Number),
+  PORT: z.coerce.number().default(4000),
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
   DATABASE_URL: z.string().min(1, 'DATABASE_URL is required'),
   REDIS_URL: z.string().default('redis://localhost:6379'),
   ELASTICSEARCH_URL: z.string().default('http://localhost:9200'),
-  WORKER_CONCURRENCY: z.string().default('5').transform(Number),
-  MIN_DELAY_BETWEEN_EMAILS_MS: z.string().default('2000').transform(Number),
-  MAX_EMAILS_PER_HOUR_PER_SENDER: z.string().default('200').transform(Number),
+  WORKER_CONCURRENCY: z.coerce.number().default(5),
+  MIN_DELAY_BETWEEN_EMAILS_MS: z.coerce.number().default(2000),
+  MAX_EMAILS_PER_HOUR_PER_SENDER: z.coerce.number().default(200),
+  MAX_HOURLY_LIMIT_ALLOWED: z.coerce.number().default(5000),
+  MAX_DELAY_ALLOWED_MS: z.coerce.number().default(3600000),
+
+  BULL_BOARD_USER: z.string().default('admin'),
+  BULL_BOARD_PASS: z.string().default('admin123'),
+
   GOOGLE_CLIENT_ID: z.string().default(''),
   GOOGLE_CLIENT_SECRET: z.string().default(''),
   GOOGLE_CALLBACK_URL: z.string().default('http://localhost:4000/auth/google/callback'),
@@ -37,7 +43,7 @@ const envSchema = z.object({
 const parsed = envSchema.safeParse(process.env);
 
 if (!parsed.success) {
-  console.error('❌ Invalid environment variables:', parsed.error.format());
+  process.stderr.write(`Invalid environment variables: ${JSON.stringify(parsed.error.format())}\n`);
   throw new Error('Invalid environment configuration');
 }
 
